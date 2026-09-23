@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.env*
+*.sqlite*
+*client.json
+server-config.json
+*.log
+profiles/
+credentials/
+out/
+inbox/

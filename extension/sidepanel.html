@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Armory · 浏览器采集</title><link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+<main class="shell">
+  <header class="masthead"><div><span class="eyebrow">BROWSER COMPANION</span><h1>Armory<span class="wordmark-dot">.</span></h1></div><span class="badge" id="connection-status">未连接</span></header>
+  <p class="intro">让 Agent 找资料。<br>浏览器里的授权，由你掌握。</p>
+  <details class="connection" open><summary>连接任务中继 <span>Relay</span></summary>
+    <form id="connect-form">
+      <label for="relay-url">Relay URL</label><input id="relay-url" type="url" placeholder="https://relay.example.com" required autocomplete="url">
+      <label for="browser-token">Browser token</label><input id="browser-token" type="password" placeholder="仅用于当前浏览器会话" required autocomplete="off">
+      <p class="hint">连接后同步任务状态。逐站点授权后，该站点正文将自动回传到此中继，供你的 Agent 使用。令牌与授权仅保留于浏览器会话。</p>
+      <div class="actions"><button type="submit" id="connect-button">连接中继</button><button type="button" class="secondary" id="disconnect-button" disabled>断开</button></div>
+    </form>
+  </details>
+  <div class="automation-control"><label class="toggle" for="auto-enabled"><input id="auto-enabled" type="checkbox"><span>自动处理已授权站点</span></label><p class="hint">会话授权最长 8 小时，可随时撤销。后台标签页自动采集；正文足够时无需人工确认。</p><div id="grants-list"></div><button class="secondary small" id="revoke-all" disabled>撤销全部会话授权</button></div>
+  <p class="notice" id="notice" role="status" aria-live="polite">打开侧栏，每 2 秒接收任务。受阻才人工，超时自动降级；关闭侧栏暂停处理。</p>
+  <section aria-labelledby="jobs-heading"><div class="section-heading"><h2 id="jobs-heading"><span>01</span>待办任务</h2><span class="meta" id="job-count">0 个</span></div>
+    <div id="jobs-list"><div class="empty"><strong>还没有待办任务</strong><p>连接中继后，Claude Code 或 Codex 发来的采集请求会出现在这里。站点首次授权后，后续任务自动运行。</p></div></div>
+  </section>
+  <section aria-labelledby="human-heading"><div class="section-heading"><h2 id="human-heading"><span>02</span>人工协作</h2><span class="meta">同一任务 · 同一标签页</span></div>
+    <div id="human-list"><div class="empty quiet"><p>仅在正文不足且受阻时请你处理。默认等待 5 分钟，超时自动回退匿名公开请求；不阻塞其他任务，不绕过访问限制。</p></div></div>
+  </section>
+  <section aria-labelledby="preview-heading"><div class="section-heading"><h2 id="preview-heading"><span>03</span>结果回看</h2><span class="badge subtle">授权范围内自动回传</span></div>
+    <div id="preview-list"><div class="empty quiet"><p>最近提取的正文会保留在当前会话。自动回传与仅本地采集明确区分；超时回退结果标记「部分正文」。</p></div></div>
+  </section>
+  <footer><button class="secondary wide" id="local-capture">采集当前页面 · 仅本地导出</button><button class="secondary wide cleanup" id="cleanup-tabs">清理已结束的后台采集页</button><p class="footnote">只提取可见正文，不读取 Cookie、登录表单或密码。<br>完成后自动清理未用于人工协作的后台页；人工页保留。<br>不绕过网站访问限制。侧栏关闭时不承诺持续实时处理。<br><a href="https://aji-q.github.io/armory-privacy/" target="_blank" rel="noopener noreferrer">隐私政策</a></p></footer>
+</main>
+<script type="module" src="sidepanel.js"></script>
+</body></html>

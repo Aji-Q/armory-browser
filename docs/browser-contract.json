@@ -1,0 +1,71 @@
+{
+  "version": 2,
+  "single_user": true,
+  "auth": "Separate agent_token and browser_token; Authorization: Bearer. Server stores SHA256 token hashes; secrets never logged.",
+  "endpoints": {
+    "GET /health": "public status only",
+    "POST /v1/jobs": "agent only: {url,purpose,max_chars?:20000,idempotency_key?:string}; return {job:JOB}, 201 (200 replay)",
+    "GET /v1/jobs/{id}": "agent or browser -> {job:JOB}",
+    "POST /v1/jobs/{id}/cancel": "agent -> {job:JOB}",
+    "GET /v1/browser/jobs": "browser -> {jobs:[JOB]} nonterminal jobs, <=100 oldest first",
+    "POST /v1/browser/jobs/{id}/events": "browser only {type,reason?:string,result?:RESULT}; return {job:JOB}"
+  },
+  "JOB": {
+    "id": "uuid",
+    "url": "http/https, no userinfo; literal private IP/localhost denied for remote jobs",
+    "purpose": "max500 chars",
+    "max_chars": "100..100000 integer",
+    "state": "queued|running|awaiting_human|awaiting_share|completed|failed|cancelled",
+    "created_at": "UTC ISO string",
+    "updated_at": "UTC ISO string",
+    "reason": "string, no raw wall HTML",
+    "result": "null or RESULT",
+    "human_timeout_seconds": "optional input; default300, integer5..900",
+    "human_deadline_at": "server ISO time or null; set on human_required",
+    "degraded": "boolean; set on human timeout"
+  },
+  "RESULT": {
+    "url": "final URL, same origin as job; no credentials",
+    "title": "max1000 chars",
+    "text": "visible extracted text limited to job.max_chars",
+    "markdown": "max 2*job.max_chars chars",
+    "links": "list of {text,url}, max200, http/https only",
+    "captured_at": "ISO date string",
+    "truncated": "boolean",
+    "degraded": "optional boolean; required true after human timeout",
+    "quality": "optional full|partial; required partial after timeout"
+  },
+  "events": {
+    "approve": "queued -> running",
+    "human_required": "running -> awaiting_human",
+    "resume": "awaiting_human -> running only before server human_deadline_at",
+    "preview_ready": "running -> awaiting_share (NO content upload)",
+    "complete": "awaiting_share -> completed (RESULT required)",
+    "fail": "any nonterminal -> failed",
+    "cancel": "any nonterminal -> cancelled",
+    "timeout": "awaiting_human -> running only at/after server human_deadline_at; sets degraded=true"
+  },
+  "limits": {
+    "max_body_bytes": 600000,
+    "queue_max": 1000,
+    "retention_days": 7
+  },
+  "extension_rules": [
+    "No cookies/debugger/webRequest permissions; no remote JS, no eval",
+    "Allow only original job origin; redirect to login IdP is not extracted; user logs in and returns",
+    "Local capture without a job is export-only; no cloud upload",
+    "Relay https only except loopback development URL; token stored storage.session, not sync",
+    "Core loop: automatic rendered capture -> ask human only if usable content blocked -> on human timeout resume automatic anonymous fallback; continue remaining jobs",
+    "First per-origin session consent authorizes automatic capture AND return to displayed relay for up to8h; scope stored in storage.session and revocable; no per-job approval for authorized scope",
+    "Before scope consent, new origin job waits without opening tab or reading page",
+    "Sufficient visible article content must not be blocked solely by a login overlay/password widget",
+    "human_required records server deadline; only resume before deadline, timeout at/after deadline; never pause whole queue",
+    "After timeout: no-cookie public fetch with bounded response/time, reject redirects to unapproved origins; partial real content yields degraded:true quality:partial; no content yields explicit failed",
+    "Sidepanel-open polling every2s; on closed panel/offline waits, after reconnect expired human jobs execute timeout fallback; persistent always-on cloud control not claimed"
+  ],
+  "mcp_tools": [
+    "armory_capture(url,purpose,max_chars?,idempotency_key?,human_timeout_seconds?)",
+    "armory_status(job_id)",
+    "armory_cancel(job_id)"
+  ]
+}
