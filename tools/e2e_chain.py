@@ -116,10 +116,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    srv.request_queue_size = 64
+    srv = None
     started = False
     try:
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        srv.request_queue_size = 64
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         started = True
         base = f"http://127.0.0.1:{srv.server_address[1]}"
@@ -128,11 +129,13 @@ def main():
         print(f"全链路异常: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     finally:
-        try:
-            if started:
-                srv.shutdown()
-        finally:
-            srv.server_close()
+        if srv is not None:
+            try:
+                # serve_forever 没成功启动时调用 shutdown 会永久等待。
+                if started:
+                    srv.shutdown()
+            finally:
+                srv.server_close()
 
 
 def run_chain(base):
@@ -168,13 +171,15 @@ def run_chain(base):
         r = subprocess.run([sys.executable, str(ROOT / "modules" / "signer" / "signer.py"),
                             "run", str(js_file), "signPage", "--args", json.dumps([target_path])],
                            capture_output=True, text=True, timeout=90)
-    js_sig = (r.stdout or "").strip().splitlines()[-1] if r.stdout.strip() else ""
+    # 退出码必须查:signer 崩溃时若 stdout 恰好留了一行,签名比对可能侥幸通过,
+    # 于是整条链路被记成成功 —— 而实际上这一步根本没跑起来
+    if r.returncode != 0:
+        print(f"    ! signer 退出码 {r.returncode}: {(r.stderr or '')[:140]}")
+        ok = False
+    js_sig = (r.stdout or "").strip().splitlines()[-1] if (r.stdout or "").strip() else ""
     expected = py_sign(target_path)
     print(f"    signer 输出: {js_sig}")
     print(f"    服务端期望:  {expected}")
-    if r.returncode != 0:
-        print(f"    ! signer 退出码 {r.returncode}(stderr: {(r.stderr or '')[:120]})")
-        ok = False
     if js_sig != expected:
         print(f"    ! 签名不一致(stderr: {(r.stderr or '')[:120]})")
         ok = False
@@ -191,13 +196,20 @@ def run_chain(base):
     if signed.status == 200:
         try:
             data = json.loads(signed.html)
-            expected_items = [{"id": i, "name": f"item-{i}"} for i in range(1, 4)]
-            if not (isinstance(data, dict) and data.get("ok") is True
-                    and data.get("q") == "hello" and data.get("items") == expected_items):
-                raise ValueError("业务响应 schema/值不匹配")
-            print(f"    拿到数据: {len(data['items'])} 条  {data['items'][:1]}")
+            if not isinstance(data, dict) or data.get("ok") is not True or data.get("q") != "hello":
+                raise ValueError("业务响应必须包含 ok=true、q=hello")
+            items = data.get("items")
+            if not isinstance(items, list) or len(items) != 3 or not all(
+                    isinstance(item, dict) and set(item) == {"id", "name"}
+                    and type(item["id"]) is int and item["id"] == index
+                    and type(item["name"]) is str and item["name"] == f"item-{index}"
+                    for index, item in enumerate(items, 1)):
+                raise ValueError("items 必须为 id=1..3/name=item-1..3 的三个对象")
+            print(f"    拿到数据: {len(items)} 条  {items[:1]}")
         except (ValueError, TypeError) as exc:
-            print(f"    ! 无效业务响应: {exc}; 响应: {signed.html[:80]}")
+            # 200 但不是 JSON,说明「带签名拿到数据」并不成立 —— 很可能只是
+            # 打到了某个 HTML 页面。仅打印不判失败会让整条链路被记成通过。
+            print(f"    ! 200 但 JSON/schema/值无效: {exc}; 响应: {(signed.html or '')[:80]}")
             ok = False
     if unsigned.error or signed.error or unsigned.status != 403 or signed.status != 200:
         print("    ! 接口行为不符预期(应为 403 → 200)")

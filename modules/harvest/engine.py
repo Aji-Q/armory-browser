@@ -26,6 +26,7 @@ import random
 import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -119,8 +120,54 @@ def playwright_module():
     return None
 
 
+def _ssl_context(ca_file=None, insecure=False):
+    """追加私有 CA,不替换系统信任库;关闭验证只接受显式 opt-in。"""
+    context = ssl.create_default_context()
+    if insecure:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    elif ca_file:
+        context.load_verify_locations(cafile=str(ca_file))
+    return context
+
+
+def _curl_ca_bundle(verify):
+    """curl 的 CA 文件替换而非追加默认根,因此创建会话专属的合并 PEM。"""
+    if not isinstance(verify, (str, Path)):
+        return verify, None
+    import re
+    from curl_cffi.curl import DEFAULT_CACERT
+    context = _ssl_context(verify)
+    # curl 可能使用 Certifi/环境指定的根,与 Python 系统根未必相同。
+    # 两者都保留,再附加用户 CA。curl_cffi 尚不支持 CAINFO_BLOB setopt。
+    context.load_verify_locations(cafile=DEFAULT_CACERT)
+    pem = ''.join(ssl.DER_cert_to_PEM_cert(cert)
+                  for cert in context.get_ca_certs(binary_form=True))
+    # get_ca_certs() 只枚举 CA:TRUE,会漏掉用户显式信任的自签名叶证书。
+    # 保留输入文件中的原始证书块,但绝不将混合 PEM 里的私钥复制到信任库。
+    certificate = re.compile(
+        rb'-----BEGIN (CERTIFICATE|TRUSTED CERTIFICATE)-----[A-Za-z0-9+/=\s]+?-----END \1-----')
+    for source in (verify, DEFAULT_CACERT):
+        pem += ''.join(match.group(0).decode('ascii') + '\n'
+                       for match in certificate.finditer(Path(source).read_bytes()))
+    directory = tempfile.TemporaryDirectory(prefix='armory-ca-')
+    try:
+        path = Path(directory.name) / 'trust.pem'
+        path.write_text(pem, encoding='ascii')
+        path.chmod(0o600)
+        return str(path), directory
+    except Exception:
+        directory.cleanup()
+        raise
+
+
+def _session_verify(session, fallback):
+    value = getattr(session, '_armory_ca_file', None)
+    return value if isinstance(value, str) else fallback
+
+
 def make_cffi_session(impersonate="chrome", proxies=None, cookies=None, timeout=15,
-                      ca_file=None):
+                      verify=True):
     """用 curl_cffi 建会话。
 
     urllib 的 TLS 指纹(Python 的 JA3)在风控面前是裸奔的 —— 换个库,
@@ -128,16 +175,30 @@ def make_cffi_session(impersonate="chrome", proxies=None, cookies=None, timeout=
     """
     if not has_module("curl_cffi"):
         return None
+    directory = None
     try:
         from curl_cffi import requests as cffi_requests
+        session_verify, directory = _curl_ca_bundle(verify)
         session = cffi_requests.Session(impersonate=impersonate, timeout=timeout,
-                                        verify=str(ca_file) if ca_file else True)
+                                        verify=session_verify)
+        if directory is not None:
+            session._armory_ca_file = session_verify
+            # 显式 close/with 清理;TemporaryDirectory 自带 GC/解释器退出兜底。
+            original_close = session.close
+            def close():
+                try:
+                    original_close()
+                finally:
+                    directory.cleanup()
+            session.close = close
         if proxies:
             session.proxies = {"http": proxies[0], "https": proxies[0]}
         for name, value in (cookies or {}).items():
             session.cookies.set(name, value)
         return session
     except Exception:
+        if directory is not None:
+            directory.cleanup()
         return None
 
 
@@ -277,7 +338,9 @@ class RobotsGate:
             try:
                 req = urllib.request.Request(base + "/robots.txt",
                                              headers={"User-Agent": self.user_agent})
-                # OpenerDirector 提供 open(), 模块入口才叫 urlopen()。
+                # OpenerDirector 只提供 open(),模块入口才叫 urlopen() —— 写成
+                # (opener or urllib.request).urlopen() 会抛 AttributeError,而它被
+                # 下面的 except 吞掉、robot 置成 None,于是 robots 检查静默放行一切。
                 open_url = opener.open if opener is not None else urllib.request.urlopen
                 with open_url(req, timeout=timeout) as resp:
                     robot.parse(resp.read().decode("utf-8", "replace").splitlines())
@@ -360,7 +423,7 @@ class Engine:
                  keepalive=True, cookies=None, max_body=10_000_000, max_redirects=10,
                  impersonate="chrome", prefer_cffi=True, pool_enabled=True, settle_ms=800,
                  proxy_check_url=None, proxy_sticky=True, render_wait_ms=6000,
-                 backend_memory=True, ca_file=None):
+                 backend_memory=True, ca_file=None, insecure=False):
         self.timeout = timeout
         self.retries = retries
         self.max_body = max_body
@@ -391,12 +454,14 @@ class Engine:
                                timeout=timeout, sticky=proxy_sticky)
                      if (pool_enabled and self.proxies) else None)
 
-        # 所有 HTTP 路径都必须验证证书链和主机名。私有 CA 用显式 PEM 文件,
-        # 绝不通过 CERT_NONE / verify=False 提高表面成功率。浏览器使用自己的
-        # 系统信任库,此 ca_file 仅用于 Python/curl HTTP 客户端。
+        # 默认验证证书链与主机名。私有 CA 用显式 PEM 文件指定,不靠关验证来
+        # 提高表面成功率 —— 后者会把中间人攻击和证书替换一并放行。
+        # 自签/过期的老站点确实存在,所以保留一个**必须主动打开**的逃生口:
+        # insecure=True 才降级,默认绝不静默关闭验证。
         self.ca_file = str(Path(ca_file).expanduser().resolve()) if ca_file else None
-        self.tls_verify = self.ca_file or True
-        self.ssl_ctx = ssl.create_default_context(cafile=self.ca_file)
+        self.insecure = bool(insecure)
+        self.tls_verify = False if self.insecure else (self.ca_file or True)
+        self.ssl_ctx = _ssl_context(self.ca_file, self.insecure)
 
         # 代理模式走 urllib(连接池与代理叠加复杂,且代理下吞吐本就不是首要)
         self.jar = http.cookiejar.CookieJar()
@@ -423,7 +488,7 @@ class Engine:
         # 表现就是「登录态明明存了,请求过去还是登录页」
         self.cookies_dict = dict(cookies or {})
         self._cffi = (make_cffi_session(impersonate, self.proxies, cookies, timeout,
-                                      ca_file=self.ca_file)
+                                        verify=self.tls_verify)
                       if prefer_cffi else None)
         self.backend_note = ("curl_cffi/" + impersonate if self._cffi else "builtin")
 
@@ -510,13 +575,14 @@ class Engine:
                 body = resp.read(self.max_body)
                 status = resp.status
                 raw_headers = resp.getheaders()
-                # read(max_body) 可能只读了一部分;未消费完的响应不能回池。
-                # 不继续排空大响应,以免为复用连接突破响应体与等待预算。
+                # read(max_body) 可能只消费了一部分响应。带着未读完的响应把连接
+                # 放回池里,下一个请求会抛 ResponseNotReady;更糟的是它被算作那次
+                # 请求的失败,进而把一个本身健康的代理推进冷却。
+                # 不为了复用而继续排空大响应 —— 那会突破响应体与等待预算。
                 reusable = resp.isclosed() and not resp.will_close
             except Exception:
                 self.conn_pool.release(scheme, host, port, conn, reusable=False)
                 raise
-
             hdrs = {}
             set_cookie = []
             for k, v in raw_headers:
@@ -577,7 +643,8 @@ class Engine:
         if self.cookies_dict:
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies_dict.items())
         resp = self._cffi.request(method, url, headers=headers, timeout=self.timeout,
-                                  allow_redirects=True, verify=self.tls_verify)
+                                  allow_redirects=True,
+                                  verify=_session_verify(self._cffi, self.tls_verify))
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
         try:
             set_cookie = resp.headers.get_list("set-cookie")
@@ -640,7 +707,7 @@ class Engine:
                     continue
                 return res
 
-            # error 描述最终结果,重试历史仍由 retries 和 stats["errors"] 保留。
+            # error 描述最终结果,失败重试历史保留在 retries/stats["errors"]。
             res.error = ""
             hdrs = {k.lower(): v for k, v in hdrs.items()}
             encoding = (hdrs.get("content-encoding") or "").lower()
@@ -694,8 +761,17 @@ class Engine:
 
     # ---------------------------------------------------------- render
 
+    def _browser_ca_error(self):
+        if self.ca_file and not self.insecure:
+            return ("ca_file 仅支持 Python/curl HTTP 客户端;浏览器后端不能加载此 PEM。"
+                    "请配置浏览器自身信任库后不带 ca_file 重试,不会静默忽略或关闭验证。")
+        return ""
+
     def fetch_render(self, url, stealth=False, wait_until="networkidle"):
         res = Result(url=url, backend="stealth" if stealth else "render")
+        if self._browser_ca_error():
+            res.error = self._browser_ca_error()
+            return res
         mod = playwright_module()
         if not mod:
             res.error = ("未安装 playwright/patchright; "
@@ -719,7 +795,7 @@ class Engine:
                     "--no-sandbox", "--disable-dev-shm-usage",
                 ])
                 context = browser.new_context(
-                    ignore_https_errors=False,
+                    ignore_https_errors=self.insecure,
                     user_agent=self.user_agent,
                     locale="zh-CN",
                     timezone_id="Asia/Shanghai",
@@ -774,6 +850,9 @@ class Engine:
     def fetch_scrapling(self, url):
         """Scrapling 适配。本机未装时不会走到这里;装了也做容错,API 变动不致命。"""
         res = Result(url=url, backend="scrapling")
+        if self._browser_ca_error():
+            res.error = self._browser_ca_error()
+            return res
         if not has_module("scrapling"):
             res.error = "未安装 scrapling"
             return res
@@ -781,10 +860,10 @@ class Engine:
         started = time.time()
         try:
             from scrapling.fetchers import StealthyFetcher
-            # Scrapling 的 StealthySession 默认忽略证书错误,必须显式覆盖。
+            # Scrapling 默认可能忽略证书错误,只有明确 --insecure 才允许。
             page = StealthyFetcher.fetch(
                 url, headless=True, network_idle=True,
-                additional_args={"ignore_https_errors": False})
+                additional_args={"ignore_https_errors": self.insecure})
             html = ""
             for attr in ("html_content", "body", "text"):
                 value = getattr(page, attr, None)
@@ -806,7 +885,7 @@ class Engine:
         """取原始字节(验证码图片、附件等)。沿用会话、代理、Cookie 与指纹。"""
         if self._cffi is not None:
             resp = self._cffi.get(url, timeout=self.timeout, allow_redirects=True,
-                                  verify=self.tls_verify)
+                                  verify=_session_verify(self._cffi, self.tls_verify))
             return resp.status_code, resp.content
         req = urllib.request.Request(url, headers=self._headers())
         with self.opener.open(req, timeout=self.timeout) as resp:
@@ -821,6 +900,9 @@ class Engine:
         实测 WebGL 报出真实显卡型号、plugins 有 5 个,而 Chromium 无头是 0 个。
         """
         res = Result(url=url, backend="camoufox")
+        if self._browser_ca_error():
+            res.error = self._browser_ca_error()
+            return res
         if not has_module("camoufox"):
             res.error = "未安装 camoufox; pip install camoufox && camoufox fetch"
             return res
@@ -843,13 +925,12 @@ class Engine:
         if persistent_dir:
             # 设备指纹持久化:对付绑定设备的站点,同一 profile 反复用
             kwargs.update(persistent_context=True, user_data_dir=persistent_dir,
-                          ignore_https_errors=False)
+                          ignore_https_errors=self.insecure)
 
         try:
             with Camoufox(**kwargs) as browser:
-                # 普通 browser 的 new_page 创建上下文;持久上下文已在上面设置。
                 page = (browser.new_page() if persistent_dir else
-                        browser.new_page(ignore_https_errors=False))
+                        browser.new_page(ignore_https_errors=self.insecure))
                 response = page.goto(url, wait_until="domcontentloaded",
                                      timeout=self.timeout * 1000)
                 try:
@@ -895,6 +976,8 @@ class Engine:
 
         比静态扫 HTML 找接口线索可靠得多:页面真正调用的东西只有真跑一遍才知道。
         """
+        if self._browser_ca_error():
+            return None, self._browser_ca_error()
         sniffs = []
         engine_used = None
         try:
@@ -911,11 +994,11 @@ class Engine:
             with opener as handle:
                 if engine_used == "camoufox":
                     browser, context = handle, None
-                    page = browser.new_page(ignore_https_errors=False)
+                    page = browser.new_page(ignore_https_errors=self.insecure)
                 else:
                     browser = handle.chromium.launch(headless=True,
                                                      args=["--disable-blink-features=AutomationControlled"])
-                    context = browser.new_context(locale="zh-CN", ignore_https_errors=False)
+                    context = browser.new_context(locale="zh-CN", ignore_https_errors=self.insecure)
                     page = context.new_page()
 
                 def on_request(req):
@@ -941,7 +1024,9 @@ class Engine:
                     try:
                         page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
                     except Exception as exc:
-                        # 导航超时仍可保留已发生的请求,证书失败则不能伪装为空成功。
+                        # 导航超时仍可保留已经发生的请求,但证书类失败不能伪装成
+                        # 「这个页面没有网络活动」—— 那会把一次被拒绝的连接
+                        # 说成一次成功的空观察
                         if any(marker in str(exc).upper() for marker in
                                ("ERR_CERT_", "SSL_ERROR_", "SEC_ERROR_", "CERTIFICATE")):
                             raise
@@ -1101,15 +1186,16 @@ class AsyncEngine:
 
     def __init__(self, concurrency=64, timeout=15, impersonate="chrome",
                  proxies=None, cookies=None, retries=2, timeout_cap=40, rate=0.0,
-                 ca_file=None):
+                 ca_file=None, insecure=False):
         self.concurrency = max(int(concurrency), 1)
         self.timeout = timeout
         self.timeout_cap = timeout_cap
         self.impersonate = impersonate
         self.proxies = list(proxies or [])
         self.cookies = dict(cookies or {})
+        # 与同步 Engine 同一套 TLS 策略,否则两条路径对同一站点一个成功一个失败
         self.ca_file = str(Path(ca_file).expanduser().resolve()) if ca_file else None
-        self.tls_verify = self.ca_file or True
+        self.tls_verify = False if insecure else (self.ca_file or True)
         self.retries = int(retries) if retries is not None else 0
         # 按域名限速。asyncio 是单线程的,这里不需要锁 —— 但必须用 await sleep,
         # 用 time.sleep 会把整个事件循环按死。
@@ -1138,7 +1224,7 @@ class AsyncEngine:
                 try:
                     resp = await session.get(url, impersonate=self.impersonate,
                                              timeout=self.timeout, allow_redirects=True,
-                                             verify=self.tls_verify)
+                                             verify=_session_verify(session, self.tls_verify))
                     content = resp.content or b""
                     self.stats["requests"] += 1
                     self.stats["bytes"] += len(content)
@@ -1171,7 +1257,8 @@ class AsyncEngine:
             return [Result(url=u, backend="async",
                            error="需要 curl_cffi: pip install curl_cffi") for u in urls]
 
-        kwargs = {"timeout": self.timeout, "verify": self.tls_verify}
+        session_verify, ca_directory = _curl_ca_bundle(self.tls_verify)
+        kwargs = {"timeout": self.timeout, "verify": session_verify}
         if self.proxies:
             kwargs["proxy"] = self.proxies[0]
         # cookie 必须走显式请求头:curl_cffi 的 session.cookies.set(name, value)
@@ -1187,11 +1274,17 @@ class AsyncEngine:
         # (线程池同条件下 7339 QPS / 117MB)。上限压在 256 更稳。
         max_clients = max(1, min(self.concurrency, 256))
         try:
-            session = AsyncSession(max_clients=max_clients, **kwargs)
-        except TypeError:
-            session = AsyncSession(**kwargs)
-        async with session as session:
-            return await asyncio.gather(*[self._one(session, u, sem) for u in urls])
+            try:
+                session = AsyncSession(max_clients=max_clients, **kwargs)
+            except TypeError:
+                session = AsyncSession(**kwargs)
+            if ca_directory is not None:
+                session._armory_ca_file = session_verify
+            async with session as session:
+                return await asyncio.gather(*[self._one(session, u, sem) for u in urls])
+        finally:
+            if ca_directory is not None:
+                ca_directory.cleanup()
 
     def run(self, urls):
         """同步入口:内部起一次事件循环。"""

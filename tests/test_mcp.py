@@ -72,7 +72,10 @@ class MCPTests(unittest.TestCase):
         serve(self.server,io.StringIO(incoming),output)
         frames=[json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(2,len(frames))
-        self.assertEqual(-32700,frames[0]['error']['code'])
+        # JSON nesting limits differ across CPython versions: valid deep JSON
+        # may parse to a non-object (Invalid Request), or exceed the parser
+        # limit (Parse error). Both must reject it and keep the next frame.
+        self.assertIn(frames[0]['error']['code'], (-32700, -32600))
         self.assertEqual({'jsonrpc':'2.0','id':'after-deep-frame','result':{}},frames[1])
         self.client.request.assert_not_called()
     def test_surrogate_id_cannot_break_utf8_output_or_next_frame(self):

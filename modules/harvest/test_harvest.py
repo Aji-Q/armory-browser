@@ -404,6 +404,23 @@ def test_backend_memory_concurrency():
         check("没留下临时文件", [f for f in os.listdir(d) if f.endswith(".tmp")], [])
 
 
+def test_save_slug_dedup():
+    """不同 URL 撞同一 slug 时,save 必须落到不同文件而不是互相覆盖。"""
+    import tempfile, os
+    import harvest as hv
+    with tempfile.TemporaryDirectory() as d:
+        recs = [{"url": "https://a.com", "status": 200},
+                {"url": "https://a.com/", "status": 200},
+                {"url": "https://a.com/index", "status": 200},
+                {"url": "https://a.com/b?x=1", "status": 200},
+                {"url": "https://a.com/b", "status": 200}]
+        hv.save(recs, d, None)
+        files = sorted(f for f in os.listdir(d)
+                       if f.endswith(".json") and f != "index.json")
+        check("五条记录落成五个文件", len(files), 5)
+        check("文件名互不重复", len(set(files)), 5)
+
+
 if __name__ == "__main__":
     print("harvest 自测 (不联网)")
     test_minidom()
@@ -422,6 +439,7 @@ if __name__ == "__main__":
     test_identity_probe_units()
     test_review_fixes()
     test_slug_collision()
+    test_save_slug_dedup()
     test_backend_memory_concurrency()
     print()
     if FAILED:

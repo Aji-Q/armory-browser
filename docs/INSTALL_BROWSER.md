@@ -1,6 +1,14 @@
 # Armory Browser Companion：安装与联调
 
-版本：0.1.1，发布候选。**本说明不表示已在 Chrome Web Store 上架，也不表示真实 Chrome、用户的 Claude Code/Codex 配置或远程云端已经连通。** 源码保持私有；外部使用者需先取得发布者提供的授权安装包。发布者：Jay Qin，联系邮箱：jayqin04@gmail.com。
+版本：0.1.2，发布候选。**本说明不表示已在 Chrome Web Store 上架，也不表示真实 Chrome、用户的 Claude Code/Codex 配置或远程云端已经连通。** 源码保持私有；外部使用者需先取得发布者提供的授权安装包。发布者：Jay Qin，联系邮箱：jayqin04@gmail.com。
+
+## 先直接使用，不配置 Agent
+
+加载 `extension/`（见第 4 节前 3 步），在目标页点击扩展图标，再点 **抓取当前页面**。
+结果可导出 Markdown / JSON，不需要运行下文的 Python、Relay 或 MCP。
+本地遇到登录墙请本人在网站登录后重新抓取；自动人机协作/超时回退属于可选 Agent 任务。
+
+以下第 1–6 节是 **可选 Agent 联动** 的配置，不是本地采集前置条件。
 
 ## 1. 组件和前提
 
@@ -17,11 +25,11 @@ Claude Code / Codex → 本地 MCP stdio 适配器 → Relay ← Chrome 侧栏
 
 ## 2. 启动本机 Relay
 
-以下路径对应本次优化副本。迁移机器时，替换为授权安装包和 Python 的**绝对路径**。所有路径变量均带引号，支持中文和空格。
+先进入克隆后的仓库根目录，再运行下列命令。Python 必须为 3.10+；如 python3 指向旧版本，请把 PYTHON 换成兼容解释器的绝对路径。所有路径变量均带引号。
 
 ```sh
-ARMORY_ROOT='/Users/qinjiaji/Documents/个人档案/04_研究与项目资料/2026/代码研究/armory/out/audit-20260923-engine/optimized'
-PYTHON='/Users/qinjiaji/Documents/个人档案/04_研究与项目资料/2026/代码研究/armory/.venv/bin/python'
+ARMORY_ROOT="$(pwd)"
+PYTHON="$(command -v python3)"
 PRIVATE_DIR="$HOME/.armory-browser"
 cd "$ARMORY_ROOT"
 "$PYTHON" -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ required"'
@@ -82,17 +90,17 @@ codex mcp list
 
 1. 打开 `chrome://extensions`，启用 **Developer mode / 开发者模式**。
 2. 点击 **Load unpacked / 加载已解压的扩展程序**，选择：
-   `/Users/qinjiaji/Documents/个人档案/04_研究与项目资料/2026/代码研究/armory/out/audit-20260923-engine/optimized/extension`
+   仓库根目录下的 `extension/` 文件夹
    不是项目总目录；所选目录内应直接有 `manifest.json`。
 3. 固定扩展图标，点击图标打开 Armory 侧栏。
-4. `Relay URL` 填 `http://127.0.0.1:8765`；`Browser token` 填本机私密文件的对应值。点击 **连接中继**，只授予该 Relay 的访问权限。
+4. 展开 **连接 Agent（可选）**，`Relay URL` 填 `http://127.0.0.1:8765`；`Browser token` 填本机私密文件的对应值。点击 **连接**，只授予该 Relay 的访问权限。
 5. 让 Agent 使用 `armory_capture` 请求一个你有权访问的公开 HTTPS 页面，并提供明确 `purpose`。不要提交 localhost、内网、带用户名密码或含凭据参数的 URL。
 6. 首次站点任务会等待。确认界面显示的站点和 Relay，点击 **授权此站点自动采集与回传 · 8h**，在 Chrome 提示中授予该网站权限。
-7. 该精确 origin 在本浏览器会话、此 Relay、最长 8 小时内自动采集并回传；**不会每个任务再问一次，也不是每页预览后手动批准**。可用 **自动处理已授权站点**、单站点 **撤销**、**撤销全部会话授权** 或 **断开** 停止后续处理。
+7. 该精确 origin 在本浏览器会话、此 Relay、最长 8 小时内自动采集并回传；**不会每个任务再问一次，也不是每页预览后手动批准**。可用 **自动处理已授权站点**、单站点 **撤销**、**撤销全部授权** 或 **断开** 停止后续处理。
 
 Chrome 网站权限与 Armory 会话授权是两层不同的控制。撤销会话授权不会自动删除 Chrome 已授予的网站权限；需要时在扩展设置中另行撤销。换 origin（协议、主机或端口）需重新授权。
 
-本地单页模式：先切到想读的正常网页，点击扩展图标，再点击 **采集当前页面 · 仅本地导出**。它使用 `activeTab` 临时授权；不创建远程任务，也不回传正文。如 Chrome 提示权限不足，应重新在目标页点击扩展图标。
+本地单页模式：先切到想读的正常网页，点击扩展图标，再点击 **抓取当前页面**。它使用 `activeTab` 临时授权；不创建远程任务，也不回传正文。如 Chrome 提示权限不足，应重新在目标页点击扩展图标。
 
 ## 5. 自动 → 人工 → 超时自动降级
 

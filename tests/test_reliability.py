@@ -109,11 +109,13 @@ class Reliability(unittest.TestCase):
                 saved = json.loads((out / page["file"]).read_text())
                 self.assertEqual(saved["url"], page["url"])
 
+    # --crawl is now a URL request budget, not a quota of distinct bodies.
+    # These frontier fixtures need four fetches to reach three unique bodies.
     def test_crawl_preserves_frontier_after_duplicates(self):
         records = [self.record("", "root", ["a", "b", "c"]),
                    self.record("a", "same"), self.record("b", "same"),
                    self.record("c", "unique")]
-        result, fetched, _ = self.crawl({r["url"]: r for r in records})
+        result, fetched, _ = self.crawl({r["url"]: r for r in records}, count=4)
         self.assertEqual(len(result), 3)
         self.assertIn("https://fixture.invalid/c", fetched)
 
@@ -121,7 +123,7 @@ class Reliability(unittest.TestCase):
         records = [self.record("", "root", ["a", "b"]),
                    self.record("a", "same"), self.record("b", "same", ["c"]),
                    self.record("c", "unique")]
-        result, fetched, _ = self.crawl({r["url"]: r for r in records})
+        result, fetched, _ = self.crawl({r["url"]: r for r in records}, count=4)
         self.assertEqual(len(result), 3)
         self.assertIn("https://fixture.invalid/c", fetched)
         self.assertTrue(all("links" not in r for r in result))
@@ -130,7 +132,7 @@ class Reliability(unittest.TestCase):
         def repeated(url):
             n = int(url.rsplit("/", 1)[1] or 0)
             return self.record(str(n) if n else "", "same", [str(n + 1)] if n < 30 else [])
-        records, fetched, stderr = self.crawl(repeated, attempt_limit=5)
+        records, fetched, stderr = self.crawl(repeated, count=10, attempt_limit=5)
         self.assertEqual(len(fetched), 5)
         self.assertEqual(len(records), 1)
         self.assertIn("5", stderr)

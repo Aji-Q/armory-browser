@@ -4,6 +4,7 @@ import { hasGrant, humanDeadline, TERMINAL } from './core.mjs';
 const $ = id => document.getElementById(id);
 const labels = { queued: '等待站点授权', running: '自动采集中', awaiting_human: '等待人工', awaiting_share: '待自动回传', completed: '已回传', failed: '失败 · 其他任务继续', cancelled: '已取消' };
 const controller = new Controller({ onChange: render, onNotice: notice });
+let previewSignature = null;
 const emptyContent = Object.fromEntries(['jobs-list', 'human-list', 'preview-list'].map(id => [id, $(id).firstElementChild.cloneNode(true)]));
 
 function notice(message, error = false) { $('notice').textContent = message; $('notice').classList.toggle('error', error); }
@@ -57,7 +58,7 @@ function render() {
   const bridge = controller.bridge;
   const active = document.activeElement?.dataset;
   const focusKey = active?.action ? [active.action, active.id || ''] : null;
-  $('connection-status').textContent = bridge.connected ? '已连接' : '未连接';
+  $('connection-status').textContent = bridge.connected ? 'Agent 已连接' : '本地模式';
   $('connection-status').classList.toggle('connected', bridge.connected);
   $('disconnect-button').disabled = !bridge.connected;
   $('auto-enabled').checked = controller.autoEnabled;
@@ -71,14 +72,27 @@ function render() {
     row.append(element('span', '', `${origin} · ${minutes ? `${minutes} 分钟` : '已过期'}`));
     row.append(button('撤销', 'revoke', origin)); grants.append(row);
   }
-  for (const id of ['jobs-list', 'human-list', 'preview-list']) $(id).replaceChildren();
+  for (const id of ['jobs-list', 'human-list']) $(id).replaceChildren();
   const jobs = Object.values(bridge.jobs).sort((a, b) => b.created_at.localeCompare(a.created_at));
   $('job-count').textContent = `${jobs.filter(job => !TERMINAL.includes(job.state)).length} 个进行中`;
-  if (controller.localPreview) $('preview-list').append(previewCard(controller.localPreview));
   for (const job of jobs) {
     if (job.state === 'awaiting_human') $('human-list').append(card(job));
-    else if (['awaiting_share', 'completed'].includes(job.state) && bridge.previews[job.id]) $('preview-list').append(previewCard(bridge.previews[job.id], job));
+    else if (['awaiting_share', 'completed'].includes(job.state) && bridge.previews[job.id]) continue;
     else $('jobs-list').append(card(job));
+  }
+  $('jobs-section').hidden = !$('jobs-list').childElementCount;
+  $('human-section').hidden = !$('human-list').childElementCount;
+  // Polling updates task deadlines, not the document the user is reading.
+  const previews = jobs.filter(job => ['awaiting_share', 'completed'].includes(job.state) && bridge.previews[job.id]);
+  const signature = JSON.stringify([controller.localPreview, previews.map(job => [job.id, job.state, bridge.previews[job.id]])]);
+  if (signature !== previewSignature) {
+    $('preview-list').replaceChildren();
+    if (controller.localPreview) $('preview-list').append(previewCard(controller.localPreview));
+    for (const job of previews) $('preview-list').append(previewCard(bridge.previews[job.id], job));
+    previewSignature = signature;
+  }
+  for (const node of $('preview-list').querySelectorAll('button[data-action]')) {
+    node.disabled = Boolean(node.dataset.id && controller.busy.has(node.dataset.id));
   }
   for (const id of ['jobs-list', 'human-list', 'preview-list']) if (!$(id).childElementCount) $(id).append(emptyContent[id].cloneNode(true));
   if (focusKey) [...document.querySelectorAll('button[data-action]')].find(node => node.dataset.action === focusKey[0] && (node.dataset.id || '') === focusKey[1])?.focus({ preventScroll: true });
@@ -100,7 +114,19 @@ $('disconnect-button').addEventListener('click', () => void guard(controller.dis
 $('auto-enabled').addEventListener('change', event => void guard(controller.toggleAutomatic(event.target.checked)));
 $('revoke-all').addEventListener('click', () => void guard(controller.revoke()));
 $('cleanup-tabs').addEventListener('click', () => void guard(controller.cleanupTabs()));
-$('local-capture').addEventListener('click', () => void guard(controller.captureLocal()));
+$('local-capture').addEventListener('click', async () => {
+  const captureButton = $('local-capture');
+  if (captureButton.disabled) return;
+  captureButton.disabled = true;
+  captureButton.textContent = '采集中…';
+  try { await controller.captureLocal(); }
+  catch (error) {
+    notice(`本次抓取失败：${error.message || '请重试'}${controller.localPreview ? '。下方保留的是上次结果，请核对来源和时间。' : ''}`, true);
+  } finally {
+    captureButton.disabled = false;
+    captureButton.textContent = '抓取当前页面';
+  }
+});
 document.addEventListener('click', event => {
   const target = event.target.closest('button[data-action]');
   if (!target) return;

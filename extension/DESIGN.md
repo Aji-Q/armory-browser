@@ -1,22 +1,13 @@
-# Armory browser companion — v0
+# 工具优先，不做展示页
 
-Design checkpoint 1: user approved cream background, dark gray type, teal actions,
-8 px spacing/radii, no decorative animation, side-panel task → human → preview flow.
+2026-09-24 用户明确：简洁清晰的爬虫工具，不需要 fancy 演示。
+本轮采用 Preserve：保留原生侧栏、已有米白/深灰/青绿、8px圆角与零动画；
+移除品牌宣传、编号分栏、默认展开的接入教程。小标题使用系统字体。
 
-Greenfield utility. Audience: a human supervising Claude Code / Codex tasks.
-Dials: visual variance 2, motion 0, information density 6, asset dependence 1,
-brand fidelity 2. A close-view, quiet sidebar with narrow-screen capacity.
-Custom tokens: paper #f6f4ee, ink #303935, accent #236e62, line #dcded5.
-Native reading typography plus Georgia wordmark. No external assets or fonts.
+首页只有抓取入口、操作反馈和可导出结果。人工协作和 Agent 任务仅有内容时出现；
+Relay 设置、授权和清理收进一个原生 details。没有新增页面、组件库或运行时依赖。
 
-Visible v0: sidepanel.html. Empty states are real placeholders, not fictional jobs.
-The second checkpoint is layout review; functionality is not claimed by the v0.
+保护的契约：固定抽取器、白名单结果、精确来源校验、授权/撤销、人工期限、匿名回退、
+取消、Markdown/JSON 导出和无中继本地采集。结果不变时不重新生成 DOM，保留阅读状态。
 
-## Confirmed workflow correction
-
-The user clarified the governing flow: automatic → blocked-only human → timeout
-back to automatic. The approved visual language remains unchanged. The sidebar
-now adds a plainly labelled session-automation control, exact destination/scope
-consent, per-origin revocation, human countdown, and full/partial result labels.
-“Result review” replaces the earlier mandatory manual-share preview concept.
-There is no required per-job approval after origin/session consent.
+不把少文件等同于好架构：流程、抽取、传输、纯状态校验分别保留，便于直接读和测试。

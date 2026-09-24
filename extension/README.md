@@ -1,87 +1,69 @@
-# Armory Browser Companion 0.1.0
+# Armory Web Capture 0.1.2
 
-Chrome Manifest V3 / Chrome 116+. This is an unpacked / Chrome Web Store candidate,
-not a claim that Google has reviewed or published it.
+一个无框架、无构建步骤的 Chrome MV3 网页正文采集工具。**不是演示页面。**
 
-## Load locally
+## 最短使用路径
 
-1. Open chrome://extensions, enable Developer mode, choose “Load unpacked”.
-2. Select this extension directory (the directory containing manifest.json).
-3. Click its toolbar action to open the side panel.
-4. Enter the Relay URL and **browser** token, not the Agent token. HTTPS is required;
-   plain HTTP is accepted only for exact localhost, 127.0.0.1, or [::1] development.
-5. When the first task for an origin appears, review the request purpose and relay,
-   then grant that origin's **automatic capture and return** scope for up to 8 hours.
-   The origin authorization covers subsequent tasks on that exact origin.
+1. 在 Chrome 扩展管理页加载本目录（目录内有 `manifest.json`）。
+2. 打开要采集的网页，点击 Armory 扩展图标。
+3. 点击 **抓取当前页面**，核对来源、正文、字符数和截断标记。
+4. 点击 **导出 Markdown** 或 **导出 JSON**，得到真实文件。
 
-The extension requires no npm packages, build step, CDN, cookie export, browser
-debugging permission, or remote code. The relay and MCP server are separate.
+这一条路径不需要 Python、Relay、Agent、模型 API key 或网站密码。
+本地结果留在当前浏览器会话，不上传。失败时会明确提示，已有结果标明仍是上次采集。
+当前单页提取上限为 20,000 字符，超出显示「已截断」。它不会递归遍历链接。
+遇到登录墙，请本人先在网站登录，再点击抓取；本地按钮不启动自动登录/回退任务。
+权限不足时，请重新在目标网页点击扩展图标，取得 Chrome 的 `activeTab` 临时授权。
 
-## Real behavior
+## Agent 任务是可选项
 
-- While the side panel is open, poll queued tasks every 2 seconds; process up to
-  three tasks concurrently. Closing the panel pauses processing. Reopening it
-  reconciles remote statuses and expired human deadlines; this is not an
-  always-on cloud-controlled browser service.
-- Authorized origins: open a dedicated background tab, extract the visible
-  article/main content, retain a session preview, and return the result
-  automatically. No per-task approval or manual Share click is required.
-- Unapproved origins: do not open/read pages or upload content. Show one
-  per-origin session consent button and the relay destination.
-- Sufficient article content is accepted even if a nonblocking sign-in or
-  verification widget also exists. Insufficient content asks for human help.
-- Human collaboration remains in the same job/tab. Manually handle the site's
-  login, challenge or subscription and return to the original origin; click
-  Resume before the server deadline. The extension never fills credentials,
-  solves CAPTCHA, or bypasses payment/access restrictions.
-- Human timeout defaults to 300 seconds (server-controlled). Waiting does not
-  block other jobs. On expiry, return to automatic processing: try a no-cookie
-  public HTTP request, maximum 20 seconds / 1.5 MB, with redirects refused.
-  Real partial content is tagged degraded:true / quality:partial. Wall text or
-  no usable content produces an explicit failed state, not false success.
-- Login provider pages and cross-origin redirects are not extracted.
-- The local-only capture button never sends that captured result to a relay.
-- Completed/cancelled non-human, inactive, tool-owned tabs are cleaned up.
-  Active tabs and tabs used for human collaboration are retained. A cleanup
-  button handles remaining eligible background tabs.
+展开 **连接 Agent（可选）**，配置你信任的 Relay 和 Browser token。
+完整配置见 [安装说明](../docs/INSTALL_BROWSER.md)。Claude Code / Codex 通过 stdio MCP
+派发 URL；插件逐站点授权后按同一条状态机运行：
 
-## Data and permissions
+```
+自动提取 → 正文可用 → 自动回传
+         → 受阻/有限等待后不足 → 请求人工处理
+                            → 用户恢复 → 重新提取
+                            → 超时 → 匿名请求 → 部分正文或明确失败
+```
 
-Required permissions: activeTab, scripting, storage, sidePanel.
-Optional host permissions are declared for HTTP(S), but are only requested for
-the specific relay when connecting and the specific site during a local origin
-consent click. No default all-sites grant, cookies, debugger or webRequest.
+- 只有明确授权的 origin（协议、主机、端口）能自动采集/回传。授权绑定 Relay，最长 8 小时，可撤销。
+- 默认人工期限 5 分钟，以服务端时间为准；其他任务不被阻塞。不会填密码或破解访问限制。
+- 匿名回退不带 Cookie、不跟随重定向，标记 `degraded=true / quality=partial`；墙文本不能当成功。
+- 侧栏打开时约每 2 秒轮询，最多 3 个任务并行；**关闭侧栏暂停处理**。
+- 本地抓取与 Agent 回传分开；连接 Agent 不会自动上传本地结果。
 
-Chrome host permissions do not distinguish TCP ports. The extension additionally
-checks the exact origin (scheme, hostname, port) before extraction and upload.
+## 代码怎么读
 
-Tokens, automatic grants and the last 12 captured previews use storage.session.
-Relay URL and job metadata/tab linkage use storage.local; no captured body or
-token is persisted there. Session grants expire within 8 hours and are
-revocable. Disconnect revokes this relay's session scopes; it cannot recall
-results already sent. Existing Chrome host permissions remain until removed
-in Chrome's extension settings. The automatic-processing switch pauses new
-reads/returns but cannot unsend an already issued request.
+```
+sidepanel.js → controller.mjs → extract.mjs       本地提取
+                           → bridge.mjs          Agent HTTP 传输
+                           → fallback.mjs        超时匿名提取
+              core.mjs                           纯状态与结果校验
+background.js                                    打开侧栏、任务锁
+```
 
-The connected relay receives task states and authorized text/Markdown/web links.
-Agent access and cloud retention are controlled by that relay's owner, not
-this extension. Avoid granting private sites to a relay you do not trust.
+保留小而清楚的模块边界，不新增框架、插件注册器、通用工作流引擎或运行时依赖。
+参考的是 [Karpathy nanoGPT](https://github.com/karpathy/nanoGPT) 的可读核心代码思路，
+不是强行单文件化。`demo/` 仅是开发夹具，不在扩展包里、不参与实际采集，也不是产品入口。
 
-## Limits and validation
+## 边界
 
-Rendered extraction is a bounded heuristic, not guaranteed semantic extraction.
-It omits hidden content, scripts, styles, forms, password/input/textarea values,
-editable elements and raw HTML. It does not OCR images/PDFs or traverse
-cross-origin frames/shadow DOM. Some restrictive sites deny extension reads.
-Anonymous fallback is inert static parsing, cannot execute JavaScript or know
-all external CSS visibility, and is therefore always marked partial.
+Chrome 116+。正文抽取是启发式，不含 OCR、PDF 解析、跨域 iframe 或 shadow DOM 遍历。
+不读取 Cookie、密码、表单值、浏览器 storage 或原始 HTML；不绕过登录/付费/访问限制。
+没有默认全站权限、远程代码、CDN、npm、Cookie 导出或调试权限。
 
-HTTP response size, result sizes, job state transitions, fixed extractor code,
-same-origin scope, and session expiry are validated. Large Unicode results are
-trimmed to remain within the relay byte limit and marked truncated.
+令牌、授权、正文预览只存 `storage.session`；Relay 地址与有限任务元数据存 `storage.local`。
+可见正文仍可能含敏感信息，请谨慎选择授权站点和中继。断开无法撤回已发送的结果。
+此版本未宣称已通过真实 Chrome 安装、真实账户登录、云端 Agent 或商店上架验收。
 
-From the parent candidate directory:
-    node --test tests/test_extension.mjs
+## 开发检查
 
-Tests use pure functions / inert mocked DOM, not the user's browser. They do
-not prove successful Chrome installation, real login, or Google publication.
+在候选项目根目录执行：
+
+```sh
+node --test tests/test_extension.mjs tests/test_controller.mjs tests/test_extraction_quality.mjs tests/test_capture_contract.mjs tests/test_minimal_panel.mjs
+```
+
+这些是函数/模拟 DOM/Chrome 接口测试，不冒充真实浏览器测试。

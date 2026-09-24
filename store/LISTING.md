@@ -1,13 +1,14 @@
-# Chrome Web Store listing draft — Armory Browser Companion
+# Chrome Web Store listing draft — Armory Web Capture
 
 **Status: release-candidate copy, not a published listing or an approval claim.**
-Version: 0.1.0 · Publisher: Jay Qin · Support: jayqin04@gmail.com.
+Old UI screenshots must be replaced with actual 0.1.2 Chrome captures before submission. Do not submit previous screenshots as the current UI.
+Version: 0.1.2 · Publisher: Jay Qin · Support: jayqin04@gmail.com.
 The source repository is private. Do not add a public source-code URL or an open-source claim.
 
 ## Store fields
 
-- **Name:** Armory Browser Companion
-- **Short description:** Browser research for Claude Code and Codex: automatic capture, human help only when blocked, timed public fallback.
+- **Name:** Armory Web Capture
+- **Short description:** Capture page text and links as Markdown or JSON. Optional Agent tasks with human help and timed public fallback.
 - **Suggested category:** Productivity; confirm the current dashboard choices at submission.
 - **Primary interface language:** Simplified Chinese.
 - **Minimum Chrome:** 116 (from the submitted manifest).
@@ -18,13 +19,15 @@ The source repository is private. Do not add a public source-code URL or an open
 
 ## Detailed description — English copy
 
-Armory Browser Companion connects your Chrome browser to research tasks from Claude Code or Codex through a separately configured Armory relay and MCP adapter.
+Armory Web Capture extracts the current page into readable text and links, with local Markdown or JSON export. Local capture needs no relay, Python, Agent or model API key.
+
+Optionally, connect Claude Code or Codex through a separately configured Armory relay and MCP adapter. The connection settings are collapsed by default; they are not a prerequisite for local capture.
 
 Authorize a website once for the current browser session, for up to eight hours. Tasks for that origin then capture and return page content automatically to the relay you selected. New sites wait for your consent. You can pause automation, revoke an origin, or disconnect at any time.
 
 When a login or verification wall actually prevents useful content from being read, Armory asks you to handle it in the dedicated browser tab. Your website credentials stay in the browser. If the human wait expires, the extension attempts an anonymous public-content fallback. Any available partial content is clearly labelled; inaccessible pages fail explicitly instead of being reported as complete. Other tasks can continue.
 
-You can also capture the current page for local Markdown or JSON export without sending it to a relay.
+Local-only capture never uploads its result to a relay, even when an Agent connection is configured. Local capture is a single-page action, not recursive crawling; human timeout fallback applies to Agent tasks.
 
 Important requirements and limits:
 - Chrome 116 or later. The interface is currently in Simplified Chinese.
@@ -34,7 +37,7 @@ Important requirements and limits:
 
 Data disclosure: authorized tasks send the page URL, title, extracted text/Markdown, selected links, capture time and result-quality metadata to your configured relay so your agent can use them. This may include personal information present in visible page content. Within an authorized origin/session, return is automatic—not an approval click for each page. Local-only exports are not uploaded. The extension does not request cookie, browser-history, debugger or web-request permissions, and does not upload website passwords, form values, cookies, browser storage or raw HTML. Relay authentication tokens are kept in browser-session storage. The current build has no advertising or analytics SDK.
 
-Armory Browser Companion is an independent project by Jay Qin, not an official product of OpenAI, Anthropic or Google. Support: jayqin04@gmail.com.
+Armory Web Capture is an independent project by Jay Qin, not an official product of OpenAI, Anthropic or Google. Support: jayqin04@gmail.com.
 
 ## Single-purpose field
 

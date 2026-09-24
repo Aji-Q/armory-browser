@@ -23,6 +23,7 @@ import json
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -191,11 +192,12 @@ def worker(args, urls, engine):
     if args.crawl:
         start = urls[0]
         seen, frontier, seen_fp = {start}, [start], set()
-        # 结果预算与抓取次数分开:重复页仍可能引出新链接,但不能无限追逐变体。
-        max_attempts = getattr(args, "max_crawl_attempts", None) or max(args.crawl * 10, 1)
+        # --crawl N 限制抓取 URL 的次数,含重复正文/失败;不是凑够 N 篇独有正文。
+        # 引擎内部同一 URL 的重试仍受 --retries 约束。旧参数只能进一步收紧预算。
+        max_attempts = min(args.crawl, getattr(args, "max_crawl_attempts", None) or args.crawl)
         attempts = 0
-        while frontier and len(results) < args.crawl and attempts < max_attempts:
-            size = min(args.crawl - len(results), max_attempts - attempts)
+        while frontier and attempts < max_attempts:
+            size = min(len(frontier), max_attempts - attempts)
             batch, frontier = frontier[:size], frontier[size:]
             attempts += len(batch)
             with concurrent.futures.ThreadPoolExecutor(
@@ -222,9 +224,9 @@ def worker(args, urls, engine):
                 if fp:
                     seen_fp.add(fp)
                 results.append(rec)
-                print(f"  [{len(results)}/{args.crawl}] {rec.get('url')}", file=sys.stderr)
-        if frontier and len(results) < args.crawl and attempts >= max_attempts:
-            note = f"达到抓取次数上限 {max_attempts},仍有 {len(frontier)} 个链接未抓取"
+                print(f"  [收录 {len(results)} 条; URL 抓取 {attempts}/{max_attempts}] {rec.get('url')}", file=sys.stderr)
+        if frontier and attempts >= max_attempts:
+            note = f"达到 URL 抓取次数上限 {max_attempts},已收录 {len(results)} 条,仍有 {len(frontier)} 个链接未抓取"
             print(f"  [预算耗尽] {note}", file=sys.stderr)
             if results:
                 results[-1].setdefault("notes", []).append(note)
@@ -244,36 +246,133 @@ def worker(args, urls, engine):
 
 
 def save(records, outdir, args):
+    """排他写新页面,最后原子提交索引;提交前失败撤销本轮所有新文件。"""
+    import os
+    import tempfile
+
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
-    index = []
-    used = {}
-    for rec in records:
-        rec.pop("_fp", None)          # 内部字段不落盘
-        base = slugify(rec["url"])
-        slug = base
-        # 不同的 URL 会撞同一个 slug:a.com / a.com/ / a.com/index 都得到 a.com__index,
-        # a/b?x=1 与 a/b 也是。不处理的话后写静默覆盖先写,而 index.json 仍然列 N 条
-        # 记录指向同一个文件 —— 看到的和落在磁盘上的不是一回事。
-        if slug in used:
+    index_path = out / "index.json"
+    old_index = None
+    if index_path.exists() or index_path.is_symlink():
+        try:
+            if index_path.is_symlink():
+                raise ValueError("索引是符号链接")
+            old_index = index_path.read_bytes()
+            previous = json.loads(old_index)
+            pages = previous["pages"]
+            if (not isinstance(previous.get("generated"), str)
+                    or not isinstance(pages, list) or previous.get("count") != len(pages)):
+                raise ValueError("不是 Armory 索引")
+            for page in pages:
+                name = page["file"]
+                if not isinstance(name, str) or Path(name).name != name:
+                    raise ValueError("索引含非本地文件名")
+                target = out / name
+                if target.is_symlink() or json.loads(target.read_text(encoding="utf-8"))["url"] != page["url"]:
+                    raise ValueError("索引与页面 URL 不一致")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise FileExistsError(f"保留已有未知 index.json,请改用空目录: {out}") from exc
+
+    # APFS 等常用卷不区分大小写;即便本机区分,文件移到另一台机器也不能相撞。
+    def filename_key(name):
+        return unicodedata.normalize("NFC", name).casefold()
+
+    used = {filename_key(p.name) for p in out.iterdir()}
+    pending = []
+    fd = None
+
+    def remember(path, stream):
+        stat = os.fstat(stream.fileno())
+        entry = (path, (stat.st_dev, stat.st_ino))
+        pending.append(entry)
+        return entry
+
+    def discard(entries):
+        first_error = None
+        for path, identity in reversed(entries):
+            try:
+                stat = path.lstat()
+                # 不删除被其他操作替换的路径,只撤销本次确实创建的 inode。
+                if (stat.st_dev, stat.st_ino) == identity:
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                first_error = first_error or exc
+        if first_error:
+            raise first_error
+
+    try:
+        index = []
+        for original in records:
+            rec = {key: value for key, value in original.items() if key != "_fp"}
+            # 文件系统限制以字节计;为摘要和数字后缀预留空间。
+            base = slugify(rec["url"]).encode("utf-8")[:150].decode("utf-8", "ignore")
             stem = f"{base}-{hashlib.sha1(rec['url'].encode('utf-8')).hexdigest()[:6]}"
-            slug, suffix = stem, 2
-            while slug in used:
-                slug = f"{stem}-{suffix}"
-                suffix += 1
-        used[slug] = rec["url"]
-        (out / f"{slug}.json").write_text(
-            json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
-        if rec.get("markdown"):
-            (out / f"{slug}.md").write_text(rec["markdown"], encoding="utf-8")
-        index.append({"url": rec["url"], "status": rec.get("status"), "backend": rec.get("backend"),
-                      "verdict": rec.get("verdict"), "title": rec.get("meta", {}).get("title"),
-                      "file": f"{slug}.json", "error": rec.get("error")})
-    (out / "index.json").write_text(
-        json.dumps({"generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "count": len(index), "pages": index}, ensure_ascii=False, indent=2),
-        encoding="utf-8")
-    return out
+            sequence = 0
+            while True:
+                slug = base if sequence == 0 else stem if sequence == 1 else f"{stem}-{sequence - 1}"
+                sequence += 1
+                names = {filename_key(slug + ".json"), filename_key(slug + ".md")}
+                if names & used:
+                    continue
+                created = []
+                try:
+                    # 'x' 也能拒绝检查与写入之间出现的文件/符号链接。
+                    path = out / f"{slug}.json"
+                    with path.open("x", encoding="utf-8") as document:
+                        created.append(remember(path, document))
+                        if rec.get("markdown"):
+                            path = out / f"{slug}.md"
+                            with path.open("x", encoding="utf-8") as markdown:
+                                created.append(remember(path, markdown))
+                                markdown.write(rec["markdown"])
+                        document.write(json.dumps(rec, ensure_ascii=False, indent=2))
+                except FileExistsError:
+                    discard(created)
+                    for entry in created:
+                        pending.remove(entry)
+                    used.update(names)
+                    continue
+                used.update(names)
+                break
+            index.append({"url": rec["url"], "status": rec.get("status"), "backend": rec.get("backend"),
+                          "verdict": rec.get("verdict"), "title": rec.get("meta", {}).get("title"),
+                          "file": f"{slug}.json", "error": rec.get("error")})
+        payload = json.dumps({"generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                              "count": len(index), "pages": index}, ensure_ascii=False, indent=2)
+        fd, name = tempfile.mkstemp(prefix=".armory-index-", suffix=".tmp", dir=out)
+        temporary = Path(name)
+        stat = os.fstat(fd)
+        pending.append((temporary, (stat.st_dev, stat.st_ino)))
+        with os.fdopen(fd, "w", encoding="utf-8") as document:
+            fd = None  # 由文件对象负责关闭;连 flush/fsync 失败也不碰原索引。
+            document.write(payload)
+            document.flush()
+            os.fsync(document.fileno())
+        if old_index is None:
+            # 同卷 hard link 原子地发布完整文件,存在任何文件/符号链接就失败。
+            # 首次提交不能用 replace,否则会覆盖检查后新出现的未知 index。
+            os.link(temporary, index_path)
+            pending.append((index_path, (stat.st_dev, stat.st_ino)))
+            temporary.unlink()
+        else:
+            if index_path.is_symlink() or index_path.read_bytes() != old_index:
+                raise FileExistsError("index.json 已被其他操作改变,未覆盖")
+            os.replace(temporary, index_path)
+        return out
+    except BaseException as exc:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            discard(pending)
+        except OSError as cleanup_error:
+            exc.add_note(f"撤销本次新文件失败: {cleanup_error}")
+        raise
 
 
 def parse_cookies(args):
@@ -377,9 +476,27 @@ def fetch_with_wait_human(engine, url, args, scout_mod, timeout):
         if new_cookies:
             try:
                 engine.cookies_dict.update(new_cookies)
-                engine._cffi = eng.make_cffi_session(engine.impersonate, engine.proxies,
-                                                     engine.cookies_dict, engine.timeout)
+                previous_session = engine._cffi
+                replacement = eng.make_cffi_session(engine.impersonate, engine.proxies,
+                                                    engine.cookies_dict, engine.timeout,
+                                                    verify=getattr(engine, "tls_verify", True))
+                session_notice = ""
+                if replacement is not None:
+                    # 先发布可用替代,再释放旧连接和它的临时 CA 文件。
+                    # 关闭失败不撤回新会话,更不能丢弃已取得的人工正文。
+                    engine._cffi = replacement
+                    if previous_session is not None and previous_session is not replacement:
+                        try:
+                            previous_session.close()
+                        except Exception as exc:
+                            session_notice = f"旧 HTTP 会话清理失败({type(exc).__name__});已保留新会话"
+                else:
+                    session_notice = "新 HTTP 会话不可用;保留原传输,人工正文不受影响"
+                if session_notice:
+                    out.notes.append(session_notice)
                 res2 = engine.fetch(url, backend=args.backend, scout_mod=scout_mod)
+                if session_notice:
+                    res2.notes.append(session_notice)
                 if res2.error:
                     detail = res2.error[:50]
                 elif not 200 <= res2.status < 300:
@@ -463,9 +580,9 @@ def main():
     ap.add_argument("--regex-on-text", action="store_true", help="正则在纯文本上跑,而非原始 HTML")
     ap.add_argument("--links", action="store_true", help="带上全部链接")
     ap.add_argument("--tables", action="store_true", help="带上表格数据")
-    ap.add_argument("--crawl", type=int, default=0, metavar="N", help="同域深度爬取,最多 N 页")
+    ap.add_argument("--crawl", type=int, default=0, metavar="N", help="同域深度爬取,最多抓取 N 个 URL(含重复/失败;内部重试另由 --retries 限制)")
     ap.add_argument("--max-crawl-attempts", type=int, default=None, metavar="N",
-                    help="深爬实际请求 URL 次数上限(含重复内容;默认页数的 10 倍)")
+                    help="兼容选项:进一步降低 --crawl 的 URL 抓取次数上限,不能扩大它")
     ap.add_argument("--crawl-any-host", action="store_true", help="深爬时不限域名")
     ap.add_argument("--profile", default=eng.DEFAULT_PROFILE, choices=list(eng.PROFILES),
                     help="开箱预设。aggressive=不限速不限并发不查 robots; "
@@ -497,6 +614,10 @@ def main():
                     help="自己启动的浏览器不自动关闭;默认用完就关")
     ap.add_argument("--no-backend-memory", action="store_true",
                     help="不读也不写后端记忆(~/.armory/backend_memory.json),每次从完整梯子重试")
+    ap.add_argument("--ca-file", help="附加到 HTTP 客户端默认信任库的 PEM CA 文件;浏览器后端不支持此参数,会明确报错")
+    ap.add_argument("--insecure", action="store_true",
+                    help="**关闭** TLS 证书与主机名验证。默认开启验证;"
+                         "只对自签/证书过期的目标使用,期间无法察觉中间人替换")
     ap.add_argument("--state-check", nargs="?", const="auto", metavar="URL",
                     help="主动探测登录态是否仍有效(不抓取)。不给 URL 时自动选探针:"
                          "站点有身份接口就打接口,否则带登录态与匿名各取一次做差分")
@@ -727,6 +848,8 @@ def main():
         proxy_check_url=args.proxy_check_url,
         proxy_sticky=args.proxy_sticky,
         backend_memory=not args.no_backend_memory,
+        ca_file=args.ca_file,
+        insecure=args.insecure,
     )
     if args.concurrency is None:
         args.concurrency = prof.get("concurrency", 8)
