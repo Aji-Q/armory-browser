@@ -250,7 +250,7 @@ test('Controller waits for local scope consent, then auto captures/previews/comp
   assert.deepEqual(h.types(), ['approve', 'preview_ready', 'complete']);
   assert.equal(h.navigations.length, 1);
   assert.equal(h.navigations[0].active, false);
-  assert.equal(h.captures.length, 1);
+  assert.equal(h.captures.length, 2, 'Two matching usable samples establish bounded readiness');
   assert.equal(job.result.quality, 'full');
   assert.equal(job.result.degraded, false);
   assert.ok(job.result.text.includes('scientific findings'));
@@ -321,7 +321,7 @@ test('Human resumes before deadline in the same tab and automatic return continu
   await h.controller.resume(job.id); await h.settle();
   assert.equal(job.state, 'completed');
   assert.deepEqual(h.types(), ['approve', 'human_required', 'resume', 'preview_ready', 'complete']);
-  assert.deepEqual(h.captures.map(capture => capture.tabId), [tabId, tabId]);
+  assert.deepEqual(h.captures.map(capture => capture.tabId), [tabId, tabId, tabId]);
   assert.equal(h.navigations.length, 1);
   assert.ok(h.tabs.has(tabId), 'Human collaboration tab remains available');
   assert.equal(job.result.degraded, false);

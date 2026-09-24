@@ -1,7 +1,11 @@
-import { Bridge } from './bridge.mjs';
-import { webURL, relayURL, permissionPattern, makeGrant, hasGrant, humanDeadline, nextAutomaticAction, canCapture, validateResult, TERMINAL } from './core.mjs';
+import { Bridge, ResultContractError } from './bridge.mjs';
+import { webURL, relayURL, permissionPattern, makeGrant, hasGrant, humanDeadline, nextAutomaticAction, canCapture, sameOrigin, sameResource, validateResult, TERMINAL } from './core.mjs';
 import { extractVisiblePage } from './extract.mjs';
 import { anonymousFallback } from './fallback.mjs';
+
+export const CAPTURE_WAIT_BUDGET_MS = 8000;
+export const CAPTURE_SAMPLE_INTERVAL_MS = 800;
+const CAPTURE_MAX_ATTEMPTS = 11;
 
 export class Controller {
   constructor({ onChange = () => {}, onNotice = () => {} } = {}) {
@@ -156,7 +160,7 @@ export class Controller {
         const tab = await chrome.tabs.create({ url: job.url, active: false });
         await this.bridge.setLocal(id, { tabId: tab.id, approved: true, ownedTab: true, tabClosed: false, localError: '' });
         job = this.bridge.jobs[id];
-        await this.waitForTab(tab.id);
+        await this.waitForTab(tab.id, id, generation);
         await this.capture(id, generation);
       } else if (action === 'capture') {
         if (!job.tabId || !job.approved) {
@@ -165,7 +169,7 @@ export class Controller {
           await this.assertAllowed(job, generation);
           const tab = await chrome.tabs.create({ url: job.url, active: false });
           await this.bridge.setLocal(id, { tabId: tab.id, approved: true, ownedTab: true, tabClosed: false, localError: '' });
-          await this.waitForTab(tab.id);
+          await this.waitForTab(tab.id, id, generation);
         }
         await this.capture(id, generation);
       } else if (action === 'timeout_fallback') {
@@ -176,8 +180,11 @@ export class Controller {
       else if (action === 'share') await this.share(id, generation);
     } catch (error) {
       if (generation === this.bridge.generation && this.bridge.jobs[id]) {
-        await this.bridge.setLocal(id, { localError: error.message });
-        this.retryAfter.set(id, Date.now() + 15000);
+        if (error.permanent) await this.stopPermanent(id, error, generation);
+        else {
+          await this.bridge.setLocal(id, { localError: error.message });
+          this.retryAfter.set(id, Date.now() + 15000);
+        }
       }
       this.onNotice(error.message, true);
     } finally {
@@ -186,41 +193,97 @@ export class Controller {
     }
   }
 
-  async waitForTab(tabId) {
+  async stopPermanent(id, error, generation) {
+    const kind = error.status ? `永久请求错误（HTTP ${error.status}）` : '本地结果不符合数据契约';
+    const reason = `${kind}：本地任务已终止，不再自动重试；修正配置后请创建新任务。`;
+    this.retryAfter.delete(id);
+    await this.bridge.setLocal(id, { localTerminal: true, localError: reason });
+    if ([401, 403].includes(error.status)) {
+      // Invalid credentials cannot report a server transition. Stop locally and
+      // disconnect explicitly rather than claiming the remote task became failed.
+      await this.bridge.disconnect();
+      return;
+    }
+    if ([404, 410].includes(error.status)) return; // The remote task no longer exists.
+    try {
+      const latest = await this.bridge.refresh(id);
+      await this.assertAllowed(latest, generation);
+      if (!TERMINAL.includes(latest.state)) await this.bridge.event(id, 'fail', { reason });
+    } catch {
+      // Preserve the honest local terminal marker if even failure reporting fails.
+      await this.bridge.setLocal(id, { localTerminal: true, localError: reason });
+    }
+  }
+
+  async waitForTab(tabId, id, generation) {
     const started = Date.now();
-    while (Date.now() - started < 20000) {
+    for (let attempt = 0; attempt < 24 && Date.now() - started < CAPTURE_WAIT_BUDGET_MS; attempt++) {
+      if (id) await this.assertAllowed(this.bridge.jobs[id], generation);
       const tab = await chrome.tabs.get(tabId);
-      if (tab.status === 'complete') { await new Promise(resolve => setTimeout(resolve, 700)); return; }
+      if (tab.status === 'complete') return;
       await new Promise(resolve => setTimeout(resolve, 350));
     }
-    // The capture still checks currently visible content, or asks for human help.
+    // Navigation has its own hard budget. Readiness is based on actual visible
+    // extraction samples below, never document.complete + an arbitrary 700 ms.
   }
 
   async capture(id, generation) {
-    const job = await this.bridge.refresh(id);
-    await this.assertAllowed(job, generation);
-    const tab = await chrome.tabs.get(job.tabId);
-    const check = canCapture(job, tab, job);
-    if (!check.allowed) { await this.requireHuman(id, check.reason); return; }
-    if (job.state !== 'running') return;
-    const permitted = await chrome.permissions.contains({ origins: [permissionPattern(job.url)] });
-    if (!permitted) throw new Error('网站权限已撤销，请重新授权此站点');
-    await this.assertAllowed(job, generation);
-    const outputs = await chrome.scripting.executeScript({ target: { tabId: job.tabId, frameIds: [0] }, func: extractVisiblePage, args: [webURL(job.url).origin, job.max_chars], world: 'ISOLATED' });
-    await this.assertAllowed(job, generation);
-    const output = outputs[0]?.result;
-    if (!output || output.humanRequired || !output.result) { await this.requireHuman(id, output?.reason || '当前页面没有足够的可见正文，请手动处理。'); return; }
-    // Refresh after reading so a remotely cancelled task is never uploaded.
+    const started = Date.now();
+    let previous = '', lastReason = '当前页面没有足够的稳定可见正文，请手动处理。';
+    for (let attempt = 0; attempt < CAPTURE_MAX_ATTEMPTS && Date.now() - started <= CAPTURE_WAIT_BUDGET_MS; attempt++) {
+      const job = await this.bridge.refresh(id);
+      await this.assertAllowed(job, generation);
+      if (job.state !== 'running') return;
+      const tab = await chrome.tabs.get(job.tabId);
+      const check = canCapture(job, tab, job);
+      if (!check.allowed) { await this.requireHuman(id, check.reason); return; }
+      const permitted = await chrome.permissions.contains({ origins: [permissionPattern(job.url)] });
+      if (!permitted) throw new Error('网站权限已撤销，请重新授权此站点');
+      await this.assertAllowed(job, generation);
+      const outputs = await chrome.scripting.executeScript({ target: { tabId: job.tabId, frameIds: [0] }, func: extractVisiblePage, args: [webURL(job.url).origin, job.max_chars], world: 'ISOLATED' });
+      await this.assertAllowed(job, generation);
+      // A navigation during script execution must not turn another page into the
+      // requested article. Check the live tab and the captured URL independently.
+      const afterTab = await chrome.tabs.get(job.tabId);
+      const afterCheck = canCapture(job, afterTab, job);
+      if (!afterCheck.allowed) { await this.requireHuman(id, afterCheck.reason); return; }
+      const output = outputs[0]?.result;
+      if (output?.result && !output.humanRequired) {
+        let safe;
+        try { safe = validateResult(output.result, job); } catch { throw new ResultContractError(); }
+        const signature = JSON.stringify([safe.url, safe.title, safe.text, safe.markdown, safe.links]);
+        if (signature === previous) {
+          const latest = await this.bridge.refresh(id);
+          await this.assertAllowed(latest, generation);
+          if (latest.state !== 'running') return;
+          await this.bridge.setPreview(id, safe);
+          await this.assertAllowed(latest, generation);
+          await this.bridge.event(id, 'preview_ready');
+          await this.share(id, generation);
+          return;
+        }
+        previous = signature;
+        lastReason = '正文仍在动态变化，有限等待结束后仍未稳定；请稍后手动恢复。';
+      } else {
+        previous = '';
+        lastReason = output?.reason || '页面仍在加载或没有足够可见正文。';
+        const explicitWall = ['identity_page', 'origin_changed', 'login_wall', 'access_challenge'].includes(output?.reasonCode);
+        const legacyWall = !output?.reasonCode && /登录|验证码|访问验证|拒绝访问|付费墙|身份认证|login|sign.?in|captcha|access denied/i.test(lastReason);
+        if (explicitWall || legacyWall) { await this.requireHuman(id, lastReason); return; }
+      }
+      if (attempt + 1 >= CAPTURE_MAX_ATTEMPTS || Date.now() - started + CAPTURE_SAMPLE_INTERVAL_MS > CAPTURE_WAIT_BUDGET_MS) break;
+      // Yield; other queued jobs keep running while this task waits for readiness.
+      await new Promise(resolve => setTimeout(resolve, CAPTURE_SAMPLE_INTERVAL_MS));
+    }
     const latest = await this.bridge.refresh(id);
-    if (latest.state !== 'running') return;
-    await this.bridge.setPreview(id, validateResult(output.result, latest));
-    await this.bridge.event(id, 'preview_ready');
-    await this.share(id, generation);
+    await this.assertAllowed(latest, generation);
+    if (latest.state === 'running') await this.requireHuman(id, `自动等待已达到 8 秒上限：${lastReason}`);
   }
 
   async requireHuman(id, reason) {
     const job = this.bridge.jobs[id];
     if (job.state !== 'running') return;
+    await this.assertAllowed(job, this.bridge.generation);
     await this.bridge.event(id, 'human_required', { reason });
     await this.bridge.setLocal(id, { humanDeadline: humanDeadline(this.bridge.jobs[id]), hadHuman: true, localError: '' });
     this.onNotice('有任务需要人工处理，倒计时结束后自动匿名回退；其他任务继续。');
@@ -264,9 +327,18 @@ export class Controller {
     const job = await this.bridge.refresh(id);
     await this.assertAllowed(job, generation);
     if (Date.now() >= humanDeadline(job)) { await this.process(id, 'timeout_fallback'); return; }
-    const tab = await chrome.tabs.get(job.tabId);
+    let tab = await chrome.tabs.get(job.tabId);
+    if (!sameResource(tab.url, job.url) && sameOrigin(tab.url, job.url) && job.ownedTab && job.approved && tab.id === job.tabId) {
+      // This navigation is the user's explicit Resume action on our own tab. It
+      // targets only the original task URL; never inspect or interact with IdP.
+      await this.assertAllowed(job, generation);
+      tab = await chrome.tabs.update(job.tabId, { url: job.url });
+      await this.waitForTab(tab.id, id, generation);
+      tab = await chrome.tabs.get(job.tabId);
+    }
     const check = canCapture(job, tab, job);
     if (!check.allowed) throw new Error(check.reason);
+    await this.assertAllowed(job, generation);
     await this.bridge.event(id, 'resume');
     await this.bridge.setLocal(id, { humanDeadline: null, localError: '' });
     await this.process(id, 'capture');

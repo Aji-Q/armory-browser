@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 MAX_BODY_BYTES = 600_000
 QUEUE_MAX = 1000
@@ -104,6 +104,7 @@ def validate_public_url(value, name="url"):
         else:
             if not literal.is_global or (getattr(literal, "ipv4_mapped", None) is not None and not literal.ipv4_mapped.is_global):
                 raise ValueError()
+            host = literal.compressed
         if any(key.lower() in SENSITIVE_QUERY_KEYS for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
             raise ValueError()
     except (ValueError, UnicodeError):
@@ -117,6 +118,27 @@ def validate_result(result, job):
     _, job_origin = validate_public_url(job["url"])
     if origin != job_origin:
         raise RelayError(400, "Result origin differs from job origin")
+    # Origin authorization is not article identity. Match the browser's URL
+    # serialization (dot segments, UTF-8, special-query apostrophe), then ignore
+    # only trailing slashes/fragments. Query order/values stay distinct.
+    def resource_key(url):
+        parts = urlsplit(url)
+        path = quote(parts.path, safe="/%:@!$&'()*+,;=-._~")
+        segments = []
+        for segment in path.split("/"):
+            dot = re.sub(r"%2e", ".", segment, flags=re.IGNORECASE)
+            if dot == ".":
+                continue
+            if dot == "..":
+                if len(segments) > 1:
+                    segments.pop()
+                continue
+            segments.append(segment)
+        path = "/".join(segments).rstrip("/") or "/"
+        query = quote(parts.query, safe="%/?@:!$&()*+,;=-._~")
+        return path, query
+    if resource_key(result["url"]) != resource_key(job["url"]):
+        raise RelayError(400, "Result page differs from requested resource")
     _string(result["title"], "result.title", maximum=1000)
     _string(result["text"], "result.text", maximum=job["max_chars"])
     if not result["text"].strip():

@@ -119,7 +119,8 @@ def playwright_module():
     return None
 
 
-def make_cffi_session(impersonate="chrome", proxies=None, cookies=None, timeout=15):
+def make_cffi_session(impersonate="chrome", proxies=None, cookies=None, timeout=15,
+                      ca_file=None):
     """用 curl_cffi 建会话。
 
     urllib 的 TLS 指纹(Python 的 JA3)在风控面前是裸奔的 —— 换个库,
@@ -129,7 +130,8 @@ def make_cffi_session(impersonate="chrome", proxies=None, cookies=None, timeout=
         return None
     try:
         from curl_cffi import requests as cffi_requests
-        session = cffi_requests.Session(impersonate=impersonate, timeout=timeout)
+        session = cffi_requests.Session(impersonate=impersonate, timeout=timeout,
+                                        verify=str(ca_file) if ca_file else True)
         if proxies:
             session.proxies = {"http": proxies[0], "https": proxies[0]}
         for name, value in (cookies or {}).items():
@@ -358,7 +360,7 @@ class Engine:
                  keepalive=True, cookies=None, max_body=10_000_000, max_redirects=10,
                  impersonate="chrome", prefer_cffi=True, pool_enabled=True, settle_ms=800,
                  proxy_check_url=None, proxy_sticky=True, render_wait_ms=6000,
-                 backend_memory=True):
+                 backend_memory=True, ca_file=None):
         self.timeout = timeout
         self.retries = retries
         self.max_body = max_body
@@ -389,9 +391,12 @@ class Engine:
                                timeout=timeout, sticky=proxy_sticky)
                      if (pool_enabled and self.proxies) else None)
 
-        self.ssl_ctx = ssl.create_default_context()
-        self.ssl_ctx.check_hostname = False
-        self.ssl_ctx.verify_mode = ssl.CERT_NONE
+        # 所有 HTTP 路径都必须验证证书链和主机名。私有 CA 用显式 PEM 文件,
+        # 绝不通过 CERT_NONE / verify=False 提高表面成功率。浏览器使用自己的
+        # 系统信任库,此 ca_file 仅用于 Python/curl HTTP 客户端。
+        self.ca_file = str(Path(ca_file).expanduser().resolve()) if ca_file else None
+        self.tls_verify = self.ca_file or True
+        self.ssl_ctx = ssl.create_default_context(cafile=self.ca_file)
 
         # 代理模式走 urllib(连接池与代理叠加复杂,且代理下吞吐本就不是首要)
         self.jar = http.cookiejar.CookieJar()
@@ -417,7 +422,8 @@ class Engine:
         # 路径上不可靠 —— set(name, value) 不带 domain 时 cookie 可能根本不发出去,
         # 表现就是「登录态明明存了,请求过去还是登录页」
         self.cookies_dict = dict(cookies or {})
-        self._cffi = (make_cffi_session(impersonate, self.proxies, cookies, timeout)
+        self._cffi = (make_cffi_session(impersonate, self.proxies, cookies, timeout,
+                                      ca_file=self.ca_file)
                       if prefer_cffi else None)
         self.backend_note = ("curl_cffi/" + impersonate if self._cffi else "builtin")
 
@@ -571,7 +577,7 @@ class Engine:
         if self.cookies_dict:
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies_dict.items())
         resp = self._cffi.request(method, url, headers=headers, timeout=self.timeout,
-                                  allow_redirects=True)
+                                  allow_redirects=True, verify=self.tls_verify)
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
         try:
             set_cookie = resp.headers.get_list("set-cookie")
@@ -713,6 +719,7 @@ class Engine:
                     "--no-sandbox", "--disable-dev-shm-usage",
                 ])
                 context = browser.new_context(
+                    ignore_https_errors=False,
                     user_agent=self.user_agent,
                     locale="zh-CN",
                     timezone_id="Asia/Shanghai",
@@ -774,7 +781,10 @@ class Engine:
         started = time.time()
         try:
             from scrapling.fetchers import StealthyFetcher
-            page = StealthyFetcher.fetch(url, headless=True, network_idle=True)
+            # Scrapling 的 StealthySession 默认忽略证书错误,必须显式覆盖。
+            page = StealthyFetcher.fetch(
+                url, headless=True, network_idle=True,
+                additional_args={"ignore_https_errors": False})
             html = ""
             for attr in ("html_content", "body", "text"):
                 value = getattr(page, attr, None)
@@ -795,7 +805,8 @@ class Engine:
     def fetch_binary(self, url):
         """取原始字节(验证码图片、附件等)。沿用会话、代理、Cookie 与指纹。"""
         if self._cffi is not None:
-            resp = self._cffi.get(url, timeout=self.timeout, allow_redirects=True)
+            resp = self._cffi.get(url, timeout=self.timeout, allow_redirects=True,
+                                  verify=self.tls_verify)
             return resp.status_code, resp.content
         req = urllib.request.Request(url, headers=self._headers())
         with self.opener.open(req, timeout=self.timeout) as resp:
@@ -831,11 +842,14 @@ class Engine:
             kwargs["proxy"] = proxy_cfg
         if persistent_dir:
             # 设备指纹持久化:对付绑定设备的站点,同一 profile 反复用
-            kwargs.update(persistent_context=True, user_data_dir=persistent_dir)
+            kwargs.update(persistent_context=True, user_data_dir=persistent_dir,
+                          ignore_https_errors=False)
 
         try:
             with Camoufox(**kwargs) as browser:
-                page = browser.new_page()
+                # 普通 browser 的 new_page 创建上下文;持久上下文已在上面设置。
+                page = (browser.new_page() if persistent_dir else
+                        browser.new_page(ignore_https_errors=False))
                 response = page.goto(url, wait_until="domcontentloaded",
                                      timeout=self.timeout * 1000)
                 try:
@@ -897,11 +911,11 @@ class Engine:
             with opener as handle:
                 if engine_used == "camoufox":
                     browser, context = handle, None
-                    page = browser.new_page()
+                    page = browser.new_page(ignore_https_errors=False)
                 else:
                     browser = handle.chromium.launch(headless=True,
                                                      args=["--disable-blink-features=AutomationControlled"])
-                    context = browser.new_context(locale="zh-CN")
+                    context = browser.new_context(locale="zh-CN", ignore_https_errors=False)
                     page = context.new_page()
 
                 def on_request(req):
@@ -926,8 +940,11 @@ class Engine:
                     page.on("response", on_response)
                     try:
                         page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # 导航超时仍可保留已发生的请求,证书失败则不能伪装为空成功。
+                        if any(marker in str(exc).upper() for marker in
+                               ("ERR_CERT_", "SSL_ERROR_", "SEC_ERROR_", "CERTIFICATE")):
+                            raise
                     page.wait_for_timeout(wait_ms)
                 finally:
                     # 同上:wait_for_timeout 抛异常时不能把浏览器漏在后台
@@ -1083,13 +1100,16 @@ class AsyncEngine:
     """
 
     def __init__(self, concurrency=64, timeout=15, impersonate="chrome",
-                 proxies=None, cookies=None, retries=2, timeout_cap=40, rate=0.0):
+                 proxies=None, cookies=None, retries=2, timeout_cap=40, rate=0.0,
+                 ca_file=None):
         self.concurrency = max(int(concurrency), 1)
         self.timeout = timeout
         self.timeout_cap = timeout_cap
         self.impersonate = impersonate
         self.proxies = list(proxies or [])
         self.cookies = dict(cookies or {})
+        self.ca_file = str(Path(ca_file).expanduser().resolve()) if ca_file else None
+        self.tls_verify = self.ca_file or True
         self.retries = int(retries) if retries is not None else 0
         # 按域名限速。asyncio 是单线程的,这里不需要锁 —— 但必须用 await sleep,
         # 用 time.sleep 会把整个事件循环按死。
@@ -1117,7 +1137,8 @@ class AsyncEngine:
                 attempt_started = time.time()
                 try:
                     resp = await session.get(url, impersonate=self.impersonate,
-                                             timeout=self.timeout, allow_redirects=True)
+                                             timeout=self.timeout, allow_redirects=True,
+                                             verify=self.tls_verify)
                     content = resp.content or b""
                     self.stats["requests"] += 1
                     self.stats["bytes"] += len(content)
@@ -1150,7 +1171,7 @@ class AsyncEngine:
             return [Result(url=u, backend="async",
                            error="需要 curl_cffi: pip install curl_cffi") for u in urls]
 
-        kwargs = {"timeout": self.timeout}
+        kwargs = {"timeout": self.timeout, "verify": self.tls_verify}
         if self.proxies:
             kwargs["proxy"] = self.proxies[0]
         # cookie 必须走显式请求头:curl_cffi 的 session.cookies.set(name, value)

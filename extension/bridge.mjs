@@ -1,5 +1,18 @@
 import { relayURL, validateJob, validateResult, boundedResult, persistentEntry, nextState, TERMINAL } from './core.mjs';
 
+export class BridgeHTTPError extends Error {
+  constructor(status) {
+    super(`中继请求失败（HTTP ${status}）；未自动重试操作`);
+    this.name = 'BridgeHTTPError';
+    this.status = status;
+    this.permanent = status >= 400 && status < 500 && ![408, 409, 425, 429].includes(status);
+  }
+}
+
+export class ResultContractError extends Error {
+  constructor() { super('本地采集结果不符合数据契约；停止该任务，未发送未经验证的正文'); this.name = 'ResultContractError'; this.permanent = true; }
+}
+
 export class Bridge {
   constructor(onChange = () => {}) {
     this.url = '';
@@ -45,7 +58,7 @@ export class Bridge {
         credentials: 'omit', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer', signal: controller.signal,
       });
       if (generation !== this.generation) throw new Error('连接已改变，本次操作已停止');
-      if (!response.ok) throw new Error(`中继请求失败（HTTP ${response.status}）；未自动重试操作`);
+      if (!response.ok) throw new BridgeHTTPError(response.status);
       const text = await response.text();
       if (text.length > 2000000) throw new Error('中继响应超过限制');
       return JSON.parse(text);
@@ -82,7 +95,7 @@ export class Bridge {
       if (this.jobs[id] && (disk.localUpdatedAt || 0) > (this.jobs[id].localUpdatedAt || 0)) this.jobs[id] = persistentEntry(this.jobs[id], disk);
     }
     // Bound history to the latest 100 tasks, retaining nonterminal tasks first.
-    const entries = Object.values(this.jobs).sort((a, b) => Number(TERMINAL.includes(a.state)) - Number(TERMINAL.includes(b.state)) || b.updated_at.localeCompare(a.updated_at)).slice(0, 100);
+    const entries = Object.values(this.jobs).sort((a, b) => Number(TERMINAL.includes(a.state) || a.localTerminal) - Number(TERMINAL.includes(b.state) || b.localTerminal) || b.updated_at.localeCompare(a.updated_at)).slice(0, 100);
     this.jobs = Object.fromEntries(entries.map(entry => [entry.id, persistentEntry(entry, entry)]));
     armoryRecords[this.url] = this.jobs;
     await chrome.storage.local.set({ armoryRecords });
@@ -98,14 +111,27 @@ export class Bridge {
 
   async poll() {
     await this.mergeLocalLinkage();
-    const response = await this.request('/v1/browser/jobs');
+    let response;
+    try { response = await this.request('/v1/browser/jobs'); }
+    catch (error) { if ([401, 403].includes(error.status)) await this.disconnect(); throw error; }
     if (!Array.isArray(response.jobs) || response.jobs.length > 100) throw new Error('中继任务列表格式无效');
     const seen = new Set();
     for (const raw of response.jobs) { const job = this.accept(raw); seen.add(job.id); }
     // The queue excludes terminal tasks; explicitly reconcile disappeared jobs.
-    for (const job of Object.values(this.jobs)) if (!TERMINAL.includes(job.state) && !seen.has(job.id)) {
-      const status = await this.request(`/v1/jobs/${encodeURIComponent(job.id)}`);
-      this.accept(status.job);
+    for (const job of Object.values(this.jobs)) if (!TERMINAL.includes(job.state) && !job.localTerminal && !seen.has(job.id)) {
+      try {
+        const status = await this.request(`/v1/jobs/${encodeURIComponent(job.id)}`);
+        this.accept(status.job);
+      } catch (error) {
+        if ([404, 410].includes(error.status)) {
+          // A lazy-TTL deletion concerns this task only. Do not let stale local
+          // metadata prevent freshly queued jobs from running on every poll.
+          this.jobs[job.id] = persistentEntry(job, { ...job, localTerminal: true, localUpdatedAt: Date.now(), localError: `本地任务已终止：中继任务已到期或删除（HTTP ${error.status}）。` });
+          continue;
+        }
+        if ([401, 403].includes(error.status)) await this.disconnect();
+        throw error;
+      }
     }
     await this.persist();
   }
@@ -124,7 +150,9 @@ export class Bridge {
     nextState(job.state, type);
     const body = { type };
     if (typeof details.reason === 'string') body.reason = details.reason.slice(0, 1000);
-    if (type === 'complete') body.result = validateResult(details.result, job);
+    if (type === 'complete') {
+      try { body.result = validateResult(details.result, job); } catch { throw new ResultContractError(); }
+    }
     // No result payload is ever sent by approve, resume, preview_ready or polling.
     const response = await this.request(`/v1/browser/jobs/${encodeURIComponent(id)}/events`, { method: 'POST', body });
     this.accept(response.job);
@@ -138,7 +166,8 @@ export class Bridge {
   }
 
   async setPreview(id, result) {
-    const safe = boundedResult(result, this.jobs[id]);
+    let safe;
+    try { safe = boundedResult(result, this.jobs[id]); } catch { throw new ResultContractError(); }
     this.previews[id] = safe;
     this.previews = Object.fromEntries(Object.entries(this.previews).sort((a, b) => b[1].captured_at.localeCompare(a[1].captured_at)).slice(0, 12));
     // Keep only this relay's last 12 previews; never let historic relay bodies fill session storage.

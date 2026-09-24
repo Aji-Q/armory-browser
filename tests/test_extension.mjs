@@ -64,7 +64,7 @@ test('result validation enforces origin, sizes, web links, timestamp, whitelist'
   assert.throws(() => validateResult({ ...result, url: 'https://id.example.com/login' }, job));
   assert.throws(() => validateResult({ ...result, text: 'x'.repeat(1001) }, job));
   assert.throws(() => validateResult({ ...result, markdown: 'x'.repeat(2001) }, job));
-  assert.throws(() => validateResult({ ...result, links: [{ text: 'X', url: 'javascript:alert(1)' }] }, job));
+  assert.deepEqual(validateResult({ ...result, links: [{ text: 'X', url: 'javascript:alert(1)' }] }, job).links, []);
   assert.throws(() => validateResult({ ...result, links: Array(201).fill(result.links[0]) }, job));
   assert.throws(() => validateResult({ ...result, captured_at: 'not-a-date' }, job));
 });

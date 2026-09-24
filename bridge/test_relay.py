@@ -152,6 +152,7 @@ class StoreTests(unittest.TestCase):
             {**sample_result(), "url": "https://idp.example.com/login"},
             {**sample_result(), "url": "http://example.com/article"},
             {**sample_result(), "url": "https://example.com:444/article"},
+            {**sample_result(), "url": "https://example.com/other"},
             {**sample_result(), "url": "https://user:secret@example.com/article"},
             {**sample_result(), "text": "a" * 101},
             {**sample_result(), "markdown": "a" * 201},
@@ -169,7 +170,7 @@ class StoreTests(unittest.TestCase):
                 self.assert_error(400, self.store.event, job["id"], {"type": "complete", "result": result})
                 self.assertEqual("awaiting_share", self.store.get(job["id"])["state"])
                 self.assertIsNone(self.store.get(job["id"])["result"])
-        result = sample_result("https://EXAMPLE.com:443/other")
+        result = sample_result("https://EXAMPLE.com:443/article/#section")
         self.assertEqual("completed", self.store.event(job["id"], {"type": "complete", "result": result})["state"])
 
     def test_server_deadline_timeout_and_late_resume(self):

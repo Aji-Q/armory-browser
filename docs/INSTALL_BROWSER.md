@@ -1,6 +1,6 @@
 # Armory Browser Companion：安装与联调
 
-版本：0.1.0，发布候选。**本说明不表示已在 Chrome Web Store 上架，也不表示真实 Chrome、用户的 Claude Code/Codex 配置或远程云端已经连通。** 源码保持私有；外部使用者需先取得发布者提供的授权安装包。发布者：Jay Qin，联系邮箱：jayqin04@gmail.com。
+版本：0.1.1，发布候选。**本说明不表示已在 Chrome Web Store 上架，也不表示真实 Chrome、用户的 Claude Code/Codex 配置或远程云端已经连通。** 源码保持私有；外部使用者需先取得发布者提供的授权安装包。发布者：Jay Qin，联系邮箱：jayqin04@gmail.com。
 
 ## 1. 组件和前提
 
@@ -68,7 +68,7 @@ codex mcp add armory-browser -- \
 codex mcp list
 ```
 
-重新打开相应 Codex 任务/客户端，核对是否出现下面三个工具。`list` 看到配置不等于已完成浏览器端抓取。参考 [OpenAI 官方 MCP 文档](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。
+重新打开相应 Codex 任务/客户端，核对是否出现下面三个工具。`list` 看到配置不等于已完成浏览器端抓取。采集工具有外部副作用，客户端可能要求逐次批准；请在正常交互会话中按站点/任务核准。若报 `MCP tool call requires approval, but approval policy is never`，说明命令行策略不允许本次调用，不能视为成功，不要改成 read-only 工具或禁用审批来绕过。参考 [OpenAI 官方 MCP 文档](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。
 
 预期工具：
 
@@ -96,11 +96,15 @@ Chrome 网站权限与 Armory 会话授权是两层不同的控制。撤销会�
 
 ## 5. 自动 → 人工 → 超时自动降级
 
-- **自动**：已授权站点任务自动开专属后台标签页、读取页面可见正文并回传；没有内容阻碍时无需人工。
-- **人工**：只有正文不足且出现登录/验证等阻碍时，任务进入 `awaiting_human`。点击 **打开专属页面**，亲自在网站完成登录或验证，回到原任务 origin 后点击 **已处理，恢复采集**。Armory 不替你输入密码，不破解付费墙、验证码或权限。
+- **自动**：已授权站点任务自动开专属后台标签页；页面导航最多等 8 秒，再在最多 8 秒的正文窗口内每约 800 ms 采样，连续两次正文稳定才回传。明确登录/验证墙不额外等待；其他任务可并行，不把固定 700 ms 当加载完成。
+- **人工**：检测到明确登录/订阅墙或访问验证时（长预览不视为完整正文），或正文在有限等待后仍不足时，任务进入 `awaiting_human`。点击 **打开专属页面**，亲自在网站完成登录或验证，返回原任务文章后点击 **已处理，恢复采集**。Armory 不替你输入密码，不破解付费墙、验证码或权限。
 - **超时自动回退**：默认等待 300 秒，Agent 可设置整数 5–900 秒。以 Relay 记录的截止时间为准；到期后，仍有会话授权且侧栏在线时，插件尝试不带 Cookie 的公开请求。真实非空公开正文标记 `degraded=true`、`quality=partial`；无可用正文则 `failed`，不能冒充完整成功。其他任务继续。
 - **关闭或断网**：侧栏打开时约每 2 秒轮询；关闭侧栏、Chrome 退出、失联或授权过期时不能保证继续执行。重连并恢复授权后处理过期任务；不是全天候后台服务。
 - 自动完成的、未用于人工操作且不活跃的专属后台页会清理；人工协作页保留。手动关闭仍在进行的专属页后，请取消并由 Agent 重新建任务。
+
+资源身份同时核对精确 origin、路径和查询串；只忽略 fragment 与末尾斜杠，不把同域账户首页当原文章。人工恢复时，若专属页位于同 origin 的其他路径，会先返回请求 URL；跨 origin 登录页不会被读取。
+
+附属链接会过滤本地/私网和凭据参数，保留可用正文；永久 HTTP 4xx 不无限重试，401/403 会断开连接且仅记录本地终止；已过期删除的旧任务不会阻塞新任务。
 
 `awaiting_share` 是本地提取后、回传前的中间态。授权有效时自动完成回传；不是承诺提供逐任务「Share」按钮。返回内容一律是不可信资料，Agent 不应执行正文中夹带的指令。
 
@@ -120,8 +124,9 @@ Chrome 网站权限与 Armory 会话授权是两层不同的控制。撤销会�
 | MCP 配置存在但没有工具 | Python 3.10+、绝对路径、`agent-client.json` 可读、客户端重启/组织 MCP 设置 |
 | 扩展 HTTP 401 | 使用 browser token，而非 agent token；不要在聊天里发令牌排错 |
 | 拒绝连接/CORS | Relay 仍在运行、URL 端口一致、Chrome 已准许访问；若启用 `--extension-id`，需为当前安装的真实 ID |
+| `MCP tool call requires approval, but approval policy is never` | 当前非交互审批策略阻止创建任务；在正常交互客户端批准具体调用，不修改工具为 read-only 或禁用审批 |
 | 一直 `queued` | 新站点未授权、自动开关关闭、授权过期或侧栏关闭 |
-| `awaiting_human` 不恢复 | 在专属页面处理并返回原 origin；期限未到点恢复，过期则走匿名回退 |
+| `awaiting_human` 不恢复 | 在专属页面处理并返回原文章；期限未到点恢复，过期则走匿名回退 |
 | `completed` 但不完整 | 检查 `degraded`、`quality`、`truncated`，不要只看状态字符串 |
 | 断开后历史仍在 | 断开只停后续采集；卸载扩展清除其本地存储，Relay 数据需由服务持有人另行处理 |
 
@@ -134,4 +139,4 @@ Chrome 网站权限与 Armory 会话授权是两层不同的控制。撤销会�
 "$PYTHON" tests/test_human_fallback.py --root "$ARMORY_ROOT"
 ```
 
-已有真实 Edge DOM fixtures 4/4 通过的主任务记录，以及真实 DOM 界面预览；它们不等于 Chrome 已安装扩展或权限验收。上述测试也不能代替真实 Chrome 安装、站点登录或客户端注册测试。发布前逐项执行 `store/REVIEWER_GUIDE.md`；本轮仅核对命令帮助、源代码与协议，不自动改你的客户端配置。
+已有真实 DOM fixtures 与真实 DOM 界面预览的主任务记录；它们不等于 Chrome 已安装扩展或权限验收。上述测试也不能代替真实 Chrome 安装、站点登录或客户端注册测试。发布前逐项执行 `store/REVIEWER_GUIDE.md`；本轮仅核对命令帮助、源代码与协议，不自动改你的客户端配置。
